@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "api/screen-resume.js": {
+      "maxDuration": 60,
+      "memory": 1024
+    }
+  },
+  "env": [
+    "GROQ_API_KEY",
+    "GMAIL_USER",
+    "GMAIL_APP_PASSWORD"
+  ]
+}
