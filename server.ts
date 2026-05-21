@@ -306,6 +306,16 @@ function startServer() {
     }
     res.json(mapCandidate(data));
   });
+  app.delete('/api/candidates/:id', async (req, res) => {
+    const { id } = req.params;
+    await supabase.from('pipeline').delete().eq('candidate_id', id);
+    await supabase.from('interviews').delete().eq('candidate_id', id);
+    await supabase.from('screenings').delete().eq('candidate_id', id);
+    await supabase.from('communications').delete().eq('candidate_id', id);
+    const { error } = await supabase.from('candidates').delete().eq('id', id);
+    if (error) return res.status(404).json({ error: 'Candidate not found' });
+    res.json({ success: true, message: 'Candidate and all records deleted.' });
+  });
 
 app.put('/api/candidates/:id', async (req, res) => {
   const { id } = req.params;
