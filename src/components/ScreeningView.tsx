@@ -175,6 +175,17 @@ export default function ScreeningView({
                     {selectedCandidate.blacklisted && <span className="text-[10px] bg-red-105 border border-red-200 text-red-700 px-2 py-0.5 rounded font-extrabold font-mono uppercase">Blacklisted CV</span>}
                   </h3>
                   <a href={`mailto:${selectedCandidate.email}`} className="text-xs text-blue-600 font-semibold hover:underline mt-0.5 block">{selectedCandidate.email}</a>
+                  <button
+  onClick={() => {
+    const newEmail = prompt('Edit candidate email:', selectedCandidate.email);
+    if (newEmail && newEmail !== selectedCandidate.email) {
+      onEditCandidate(selectedCandidate.id, { email: newEmail });
+    }
+  }}
+  className="text-xs text-blue-500 underline mt-1"
+>
+  ✏️ Edit Email
+</button>
                   <p className="text-[11px] text-slate-400 mt-1 font-mono">Location Match: {selectedCandidate.location} • Degree: {selectedCandidate.education?.degree || 'Parsed Record'}</p>
                 </div>
                 
