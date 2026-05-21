@@ -488,7 +488,6 @@ export default function App() {
             <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
           </div>
           <div className="flex items-center gap-3">
-            <span className="text-xs font-semibold text-slate-400 font-mono">Date: 2026-05-20</span>
           </div>
         </header>
 
