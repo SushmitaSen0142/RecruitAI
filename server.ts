@@ -527,5 +527,10 @@ function startServer() {
     app.listen(PORT, '0.0.0.0', () => console.log(`Production server: http://localhost:${PORT}`));
   }
 }
-
+// Keep-alive ping every 10 mins
+setInterval(() => {
+  fetch('https://recruitai-yc07.onrender.com/api/status')
+    .then(() => console.log('[Keep-alive] pinged'))
+    .catch(() => {});
+}, 10 * 60 * 1000);
 startServer();
