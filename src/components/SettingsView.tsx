@@ -136,28 +136,7 @@ export default function SettingsView({ statusMode }: SettingsViewProps) {
             </form>
           </div>
 
-          {/* Key Secrets mapping panel */}
-          <div className="bg-white rounded-xl border border-slate-200/60 shadow-sm p-6 space-y-4 text-xs font-semibold text-slate-600">
-            <h3 className="font-bold text-slate-950 text-sm flex items-center gap-2 text-slate-950">
-              <Key className="w-4 h-4 text-blue-600" /> Model Secrets & Environment
-            </h3>
-
-            <div className="space-y-3 font-medium">
-              <div>
-                <span className="text-slate-500 block text-[11px]">GEMINI_API_KEY (Defined server side)</span>
-                <input
-                  id="gemini-env-dummy"
-                  type="text"
-                  disabled
-                  value={geminiVar}
-                  className="w-full px-3 py-1.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-500 mt-1 text-xs"
-                />
-              </div>
-              <p className="text-[10px] text-slate-400 font-mono italic">
-                Defined inside .env.example. Users can configure live keys via the Secrets panel inside Google AI Studio for production execution.
-              </p>
-            </div>
-          </div>
+          
 
           {/* SMTP Server Configuration card */}
           <div className="bg-white rounded-xl border border-slate-200/60 shadow-sm p-6 space-y-4">
