@@ -40,7 +40,7 @@ export default function CandidatePortalView({ jobs, candidates, pipeline, interv
     setTimeout(() => setPortalStatus(''), 2500);
   };
 
-  const stagesSequence = ['applied', 'screening', 'shortlisted', 'interview', 'offer', 'hired'];
+  const stagesSequence = ['applied', 'screening', 'shortlisted', 'interview', 'offer', 'hired', 'rejected'];
 
   // Map system stages to nice, generic user-facing progression info to avoid leaking internal notes
   const getStageUserDescription = (stage: string) => {
@@ -200,7 +200,9 @@ export default function CandidatePortalView({ jobs, candidates, pipeline, interv
               <span className="text-xs font-bold text-slate-500 uppercase font-mono block">Recruitment Tracking Steps</span>
               
               <div className="relative border-l border-blue-200 pl-6 ml-3 space-y-6">
-                {activePip.stageHistory.map((h, i) => (
+                {activePip.stageHistory
+  .filter((h, i, arr) => arr.findIndex(x => x.stage === h.stage) === i)
+  .map((h, i) => (
                   <div key={i} className="relative">
                     {/* Circle marker on line */}
                     <div className="absolute -left-[31px] top-1 bg-white p-1 rounded-full border border-blue-400 ring-4 ring-blue-50 flex items-center justify-center">
