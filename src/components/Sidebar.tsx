@@ -38,7 +38,6 @@ export default function Sidebar({ currentTab, setTab, recruiterMode, setRecruite
 
   const candidateMenuItems = [
     { id: 'portal', label: 'My Progress Tracker', icon: User },
-    { id: 'settings', label: 'Profile Settings', icon: Settings },
   ];
 
   const activeMenu = recruiterMode ? recruiterMenuItems : candidateMenuItems;
