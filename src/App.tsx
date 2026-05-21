@@ -96,7 +96,7 @@ export default function App() {
     }
   };
 
-  const handleDeleteJob = async (id: string) => {
+  const handleEditCandidate = async (id: string, updates: Partial<Candidate>) => {   try {     await fetch(`/api/candidates/${id}`, {       method: 'PUT',       headers: { 'Content-Type': 'application/json' },       body: JSON.stringify(updates)     }).then(r => r.json());     await syncStateData();   } catch (err) {     console.error('Candidate update failed:', err);   } };{
     try {
       await fetch(`/api/jobs/${id}`, { method: 'DELETE' }).then(r => r.json());
       await syncStateData();
