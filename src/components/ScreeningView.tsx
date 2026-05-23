@@ -356,8 +356,7 @@ export default function ScreeningView({
           )}
           
           <div className="pt-4 border-t border-slate-100 font-mono text-[9px] text-slate-400 flex justify-between uppercase">
-            <span>Powered by Google Studio build model integration</span>
-            <span>Target matching accuracy compliance: 99.8%</span>
+            
           </div>
         </div>
 
