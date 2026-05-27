@@ -6,6 +6,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 import { Job, Candidate, Screening, PipelineItem, PipelineStage, Communication, Interview } from './src/types';
 import nodemailer from 'nodemailer';
+import pdfParse from 'pdf-parse';
 
 dotenv.config();
 
@@ -223,6 +224,108 @@ function startServer() {
   app.get('/api/status', (req, res) => {
     const hasKey = !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY';
     res.json({ configured: hasKey, mode: hasKey ? 'Production Gemini (Live)' : 'Simulation (Heuristic Fallback)' });
+  });
+
+  // ── PARSE RESUME ──────────────────────────────────────────────────────────
+  app.post('/api/parse-resume', async (req, res) => {
+    try {
+      const { fileBase64, fileName } = req.body;
+      if (!fileBase64) return res.status(400).json({ error: 'No file data provided' });
+
+      // Step 1: Extract raw text from PDF
+      const buffer = Buffer.from(fileBase64, 'base64');
+      let rawText = '';
+      try {
+        const parsed = await pdfParse(buffer);
+        rawText = parsed.text || '';
+      } catch (e) {
+        rawText = '';
+      }
+
+      if (!rawText || rawText.trim().length < 30) {
+        // Fallback: return minimal data from filename only
+        const cleanName = (fileName || 'Candidate')
+          .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
+          .replace(/\b\w/g, (c: string) => c.toUpperCase());
+        return res.json({
+          name: cleanName, email: '', phone: '', location: '',
+          skills: [], experienceYears: 0,
+          companies: [], education: { degree: '', field: '', school: '', graduationYear: 0 },
+          resumeText: rawText || `Resume file: ${fileName}`
+        });
+      }
+
+      // Step 2: Use Gemini to extract structured candidate data
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+        // No Gemini — do basic regex extraction from text
+        const emailMatch = rawText.match(/[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}/);
+        const phoneMatch = rawText.match(/[\+\(]?[\d\s\-\(\)]{9,15}/);
+        const lines = rawText.split('\n').map((l: string) => l.trim()).filter(Boolean);
+        return res.json({
+          name: lines[0] || 'Unknown Candidate',
+          email: emailMatch ? emailMatch[0] : '',
+          phone: phoneMatch ? phoneMatch[0].trim() : '',
+          location: '', skills: [], experienceYears: 0,
+          companies: [], education: { degree: '', field: '', school: '', graduationYear: 0 },
+          resumeText: rawText
+        });
+      }
+
+      const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
+      const prompt = `Extract structured candidate information from this resume text. Return ONLY valid JSON.
+
+RESUME TEXT:
+${rawText.slice(0, 8000)}
+
+Extract and return this exact JSON structure:
+{
+  "name": "full name",
+  "email": "email address or empty string",
+  "phone": "phone number or empty string",
+  "location": "city, country or empty string",
+  "skills": ["skill1", "skill2"],
+  "experienceYears": 0,
+  "companies": [{"company": "name", "role": "title", "duration": "X years"}],
+  "education": {"degree": "degree type", "field": "field of study", "school": "institution", "graduationYear": 0},
+  "resumeText": "full extracted resume text"
+}
+
+Rules:
+- Extract ONLY information actually present in the resume
+- skills must be specific technical skills, tools, languages from the resume
+- experienceYears = total years of work experience found
+- If a field is not found, use empty string or empty array
+- resumeText = the full raw text provided`;
+
+      const result = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: prompt,
+        config: { responseMimeType: 'application/json' }
+      });
+
+      let parsed: any = {};
+      try {
+        parsed = JSON.parse(result.text || '{}');
+      } catch {
+        parsed = {};
+      }
+
+      res.json({
+        name: parsed.name || 'Unknown Candidate',
+        email: parsed.email || '',
+        phone: parsed.phone || '',
+        location: parsed.location || '',
+        skills: Array.isArray(parsed.skills) ? parsed.skills : [],
+        experienceYears: Number(parsed.experienceYears) || 0,
+        companies: Array.isArray(parsed.companies) ? parsed.companies : [],
+        education: parsed.education || { degree: '', field: '', school: '', graduationYear: 0 },
+        resumeText: rawText
+      });
+    } catch (err: any) {
+      console.error('[PARSE-RESUME ERROR]', err);
+      res.status(500).json({ error: err.message || 'Failed to parse resume' });
+    }
   });
 
   // ── JOBS ──────────────────────────────────────────────────────────────────
