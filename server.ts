@@ -7,6 +7,7 @@ import { createClient } from '@supabase/supabase-js';
 import { Job, Candidate, Screening, PipelineItem, PipelineStage, Communication, Interview } from './src/types';
 import nodemailer from 'nodemailer';
 
+
 dotenv.config();
 
 const supabase = createClient(
@@ -75,32 +76,37 @@ function mapInterview(r: any): Interview {
   };
 }
 
+
+function heuristicEval(candidate: Candidate, job: Job): Partial<Screening> {
+  const matched = candidate.skills.filter(s => job.requiredSkills.some(rs => rs.toLowerCase() === s.toLowerCase()));
+  const missing = job.requiredSkills.filter(rs => !candidate.skills.some(s => s.toLowerCase() === rs.toLowerCase()));
+  const niceToHave = candidate.skills.filter(s => job.niceToHaveSkills.some(nt => nt.toLowerCase() === s.toLowerCase()));
+  let baseScore = 60 + (matched.length / Math.max(1, job.requiredSkills.length)) * 30;
+  if (candidate.experienceYears >= job.experienceYears) baseScore += 8; else baseScore -= 10;
+  baseScore = Math.min(100, Math.max(15, Math.round(baseScore)));
+  let tier: Screening['tier'] = 'consider';
+  if (baseScore >= 85) tier = 'strong_match';
+  else if (baseScore >= 70) tier = 'good_fit';
+  else if (baseScore < 45) tier = 'not_match';
+  return {
+    score: baseScore, tier,
+    reasoning: `(Heuristic) Matches ${matched.length}/${job.requiredSkills.length} required skills.`,
+    skillMatch: { matched, missing, niceToHave },
+    experienceAlignment: `${candidate.experienceYears} yrs vs ${job.experienceYears} required.`,
+    educationAlignment: `${candidate.education?.degree || 'N/A'} in ${candidate.education?.field || 'N/A'}.`,
+    redFlags: candidate.experienceYears < job.experienceYears ? ['Less experience than required'] : [],
+    biasIndicators: { ageRisk: false, genderRisk: false, locationRisk: false, explanation: 'No bias detected.' },
+    proposedQuestions: [`Describe your experience with ${matched[0] || 'your main tech stack'}.`],
+    estimatedOnboarding: candidate.experienceYears > 6 ? 'Easy (1-2 weeks)' : 'Moderate (2-4 weeks)',
+    strengths: matched.length > 0 ? [`Proficient in ${matched.slice(0, 3).join(', ')}`] : ['Profile under review']
+  };
+}
+
 function runAiEvaluation(job: Job, candidate: Candidate): Promise<Partial<Screening>> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey === '') {
     return new Promise((resolve) => {
-      const matched = candidate.skills.filter(s => job.requiredSkills.some(rs => rs.toLowerCase() === s.toLowerCase()));
-      const missing = job.requiredSkills.filter(rs => !candidate.skills.some(s => s.toLowerCase() === rs.toLowerCase()));
-      const niceToHave = candidate.skills.filter(s => job.niceToHaveSkills.some(nt => nt.toLowerCase() === s.toLowerCase()));
-      let baseScore = 60 + (matched.length / Math.max(1, job.requiredSkills.length)) * 30;
-      if (candidate.experienceYears >= job.experienceYears) baseScore += 8; else baseScore -= 10;
-      baseScore = Math.min(100, Math.max(15, Math.round(baseScore)));
-      let tier: Screening['tier'] = 'consider';
-      if (baseScore >= 85) tier = 'strong_match';
-      else if (baseScore >= 70) tier = 'good_fit';
-      else if (baseScore < 45) tier = 'not_match';
-      setTimeout(() => resolve({
-        score: baseScore, tier,
-        reasoning: `(Simulated) Candidate matches ${matched.length}/${job.requiredSkills.length} required skills.`,
-        skillMatch: { matched, missing, niceToHave },
-        experienceAlignment: `${candidate.experienceYears} years vs ${job.experienceYears} required.`,
-        educationAlignment: `${candidate.education.degree} in ${candidate.education.field}.`,
-        redFlags: candidate.experienceYears < job.experienceYears ? ['Fewer years than role baseline'] : [],
-        biasIndicators: { ageRisk: false, genderRisk: false, locationRisk: false, explanation: 'No risk points spotted.' },
-        proposedQuestions: [`Tell us about your experience with ${matched[0] || 'your core stack'}.`],
-        estimatedOnboarding: candidate.experienceYears > 6 ? 'Easy (1-2 weeks)' : 'Moderate (2-4 weeks)',
-        strengths: [`Strong knowledge of ${matched.slice(0, 3).join(', ')}`]
-      }), 900);
+      setTimeout(() => resolve(heuristicEval(candidate, job)), 300);
     });
   }
 
@@ -126,7 +132,12 @@ function runAiEvaluation(job: Job, candidate: Candidate): Promise<Partial<Screen
         required: ['score', 'tier', 'reasoning', 'skillMatch', 'experienceAlignment', 'educationAlignment', 'redFlags', 'biasIndicators', 'proposedQuestions', 'estimatedOnboarding', 'strengths']
       }
     }
-  }).then(res => { try { return JSON.parse(res.text || '{}'); } catch { throw new Error('AI returned malformed output'); } });
+  })
+  .then(res => { try { return JSON.parse(res.text || '{}'); } catch { return heuristicEval(candidate, job); } })
+  .catch((err: any) => {
+    console.warn('[AI FALLBACK] Using heuristic:', err?.message?.slice(0, 100));
+    return heuristicEval(candidate, job);
+  });
 }
 
 async function getSmtpConfig() {
@@ -217,13 +228,108 @@ async function autoScheduleCandidateInterview(candidateId: string, jobId: string
 function startServer() {
   const app = express();
   const PORT = 3000;
-  app.use(express.json());
+  app.use(express.json({ limit: '20mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
   // ── STATUS ────────────────────────────────────────────────────────────────
   app.get('/api/status', (req, res) => {
     const hasKey = !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY';
     res.json({ configured: hasKey, mode: hasKey ? 'Production Gemini (Live)' : 'Simulation (Heuristic Fallback)' });
   });
+
+  // ── PARSE RESUME (Gemini reads PDF natively — no extra libraries needed) ──
+  app.post('/api/parse-resume', async (req, res) => {
+    try {
+      const { fileBase64, fileName } = req.body;
+      if (!fileBase64) return res.status(400).json({ error: 'No file data provided' });
+
+      const apiKey = process.env.GEMINI_API_KEY;
+
+      // No Gemini key — return name from filename only
+      if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+        const cleanName = (fileName || 'Candidate')
+          .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
+          .replace(/\b\w/g, (c: string) => c.toUpperCase());
+        return res.json({
+          name: cleanName, email: '', phone: '', location: '',
+          skills: [], experienceYears: 0, companies: [],
+          education: { degree: '', field: '', school: '', graduationYear: 0 },
+          resumeText: `Resume: ${fileName}`
+        });
+      }
+
+      // Send PDF base64 directly to Gemini — it reads PDFs natively
+      const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
+
+      const prompt = `You are a resume parser. Read this PDF resume carefully and extract all candidate information.
+Return ONLY a valid JSON object. No markdown, no backticks, no explanation — just JSON.
+
+{
+  "name": "candidate full name",
+  "email": "email address or empty string",
+  "phone": "phone number or empty string",
+  "location": "city and country or empty string",
+  "skills": ["actual", "skills", "from", "resume"],
+  "experienceYears": 0,
+  "companies": [{"company": "name", "role": "title", "duration": "X years"}],
+  "education": {"degree": "degree type", "field": "field of study", "school": "institution", "graduationYear": 2020},
+  "resumeText": "complete text content of the resume"
+}
+
+Rules:
+- Extract ONLY what is actually written in the resume — never invent anything
+- skills = real technical skills, tools, frameworks, languages listed in the resume
+- experienceYears = total years of professional work experience
+- If a field is missing use empty string or 0`;
+
+      const result = await ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { inlineData: { mimeType: 'application/pdf', data: fileBase64 } },
+              { text: prompt }
+            ]
+          }
+        ]
+      });
+
+      let parsed: any = {};
+      try {
+        const text = (result.text || '').replace(/```json|```/g, '').trim();
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = {};
+      }
+
+      console.log(`[PARSE-RESUME OK] ${parsed.name || fileName}`);
+      res.json({
+        name: parsed.name || 'Unknown Candidate',
+        email: parsed.email || '',
+        phone: parsed.phone || '',
+        location: parsed.location || '',
+        skills: Array.isArray(parsed.skills) ? parsed.skills : [],
+        experienceYears: Number(parsed.experienceYears) || 0,
+        companies: Array.isArray(parsed.companies) ? parsed.companies : [],
+        education: parsed.education || { degree: '', field: '', school: '', graduationYear: 0 },
+        resumeText: parsed.resumeText || ''
+      });
+    } catch (err: any) {
+      console.warn('[PARSE-RESUME FALLBACK]', err.message?.slice(0, 80));
+      // Always return something usable — never crash the upload
+      const cleanName = (fileName || 'Candidate')
+        .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
+        .replace(/\b\w/g, (c: string) => c.toUpperCase());
+      res.json({
+        name: cleanName, email: '', phone: '', location: '',
+        skills: [], experienceYears: 0, companies: [],
+        education: { degree: '', field: '', school: '', graduationYear: 0 },
+        resumeText: `Resume: ${fileName}`
+      });
+    }
+  });
+
 
   // ── JOBS ──────────────────────────────────────────────────────────────────
   app.get('/api/jobs', async (req, res) => {
