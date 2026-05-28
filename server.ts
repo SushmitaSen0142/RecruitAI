@@ -1,665 +1,466 @@
-import express from 'express';
-import path from 'path';
-import { createServer as createViteServer } from 'vite';
-import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
-import { createClient } from '@supabase/supabase-js';
-import { Job, Candidate, Screening, PipelineItem, PipelineStage, Communication, Interview } from './src/types';
-import nodemailer from 'nodemailer';
+/**
+ * server.ts — Recruit-AI
+ *
+ * AI provider: OpenRouter (meta-llama/llama-3.3-70b-instruct:free)
+ * No Gemini dependency anywhere.
+ *
+ * Env vars required:
+ *   OPENROUTER_API_KEY   — your sk-or-v1-... key from openrouter.ai
+ *   SUPABASE_URL         — your existing Supabase URL
+ *   SUPABASE_KEY         — your existing Supabase key
+ *   PORT                 — optional, defaults to 3000
+ */
 
+import express, { Request, Response } from 'express';
+import cors from 'cors';
 
-dotenv.config();
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '20mb' })); // PDF base64 can be large
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!
-);
+// ─── OpenRouter config ────────────────────────────────────────────────────────
 
-function mapJob(r: any): Job {
-  return {
-    id: r.id, title: r.title, department: r.department, location: r.location,
-    description: r.description, requiredSkills: r.required_skills ?? [],
-    niceToHaveSkills: r.nice_to_have_skills ?? [], experienceYears: r.experience_years,
-    salaryMin: r.salary_min, salaryMax: r.salary_max, currency: r.currency,
-    status: r.status, createdAt: r.created_at, strictness: r.strictness,
-    weights: r.weights
-  };
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const OPENROUTER_MODEL   = 'meta-llama/llama-3.3-70b-instruct:free';
+const OPENROUTER_URL     = 'https://openrouter.ai/api/v1/chat/completions';
+
+if (!OPENROUTER_API_KEY) {
+  console.warn('[WARN] OPENROUTER_API_KEY is not set — AI features will use heuristic fallback only');
 }
 
-function mapCandidate(r: any): Candidate {
-  return {
-    id: r.id, name: r.name, email: r.email, phone: r.phone, location: r.location,
-    skills: r.skills ?? [], experienceYears: r.experience_years,
-    companies: r.companies ?? [], education: r.education ?? {},
-    resumeText: r.resume_text, uploadedAt: r.uploaded_at,
-    resumeFileName: r.resume_file_name,
-    blacklisted: r.blacklisted ?? false, blacklistReason: r.blacklist_reason
-  };
-}
+// ─── OpenRouter helper ────────────────────────────────────────────────────────
 
-function mapScreening(r: any): Screening {
-  return {
-    id: r.id, candidateId: r.candidate_id, jobId: r.job_id,
-    score: r.score, tier: r.tier, reasoning: r.reasoning,
-    skillMatch: r.skill_match ?? { matched: [], missing: [], niceToHave: [] },
-    experienceAlignment: r.experience_alignment, educationAlignment: r.education_alignment,
-    redFlags: r.red_flags ?? [], biasIndicators: r.bias_indicators ?? {},
-    proposedQuestions: r.proposed_questions ?? [],
-    estimatedOnboarding: r.estimated_onboarding, strengths: r.strengths ?? [],
-    screenedAt: r.screened_at
-  };
-}
-
-function mapPipeline(r: any): PipelineItem {
-  return {
-    candidateId: r.candidate_id, jobId: r.job_id,
-    currentStage: r.current_stage, stageHistory: r.stage_history ?? [],
-    decision: r.decision, hireDate: r.hire_date,
-    interviewFeedback: r.interview_feedback
-  };
-}
-
-function mapCommunication(r: any): Communication {
-  return {
-    id: r.id, candidateId: r.candidate_id, jobId: r.job_id,
-    type: r.type, subject: r.subject, body: r.body,
-    status: r.status, sentAt: r.sent_at
-  };
-}
-
-function mapInterview(r: any): Interview {
-  return {
-    id: r.id, candidateId: r.candidate_id, jobId: r.job_id,
-    date: r.date, time: r.time, type: r.type,
-    interviewer: r.interviewer, status: r.status,
-    meetingLink: r.meeting_link, rating: r.rating, feedback: r.feedback
-  };
-}
-
-
-function heuristicEval(candidate: Candidate, job: Job): Partial<Screening> {
-  const matched = candidate.skills.filter(s => job.requiredSkills.some(rs => rs.toLowerCase() === s.toLowerCase()));
-  const missing = job.requiredSkills.filter(rs => !candidate.skills.some(s => s.toLowerCase() === rs.toLowerCase()));
-  const niceToHave = candidate.skills.filter(s => job.niceToHaveSkills.some(nt => nt.toLowerCase() === s.toLowerCase()));
-  let baseScore = 60 + (matched.length / Math.max(1, job.requiredSkills.length)) * 30;
-  if (candidate.experienceYears >= job.experienceYears) baseScore += 8; else baseScore -= 10;
-  baseScore = Math.min(100, Math.max(15, Math.round(baseScore)));
-  let tier: Screening['tier'] = 'consider';
-  if (baseScore >= 85) tier = 'strong_match';
-  else if (baseScore >= 70) tier = 'good_fit';
-  else if (baseScore < 45) tier = 'not_match';
-  return {
-    score: baseScore, tier,
-    reasoning: `(Heuristic) Matches ${matched.length}/${job.requiredSkills.length} required skills.`,
-    skillMatch: { matched, missing, niceToHave },
-    experienceAlignment: `${candidate.experienceYears} yrs vs ${job.experienceYears} required.`,
-    educationAlignment: `${candidate.education?.degree || 'N/A'} in ${candidate.education?.field || 'N/A'}.`,
-    redFlags: candidate.experienceYears < job.experienceYears ? ['Less experience than required'] : [],
-    biasIndicators: { ageRisk: false, genderRisk: false, locationRisk: false, explanation: 'No bias detected.' },
-    proposedQuestions: [`Describe your experience with ${matched[0] || 'your main tech stack'}.`],
-    estimatedOnboarding: candidate.experienceYears > 6 ? 'Easy (1-2 weeks)' : 'Moderate (2-4 weeks)',
-    strengths: matched.length > 0 ? [`Proficient in ${matched.slice(0, 3).join(', ')}`] : ['Profile under review']
-  };
-}
-
-function runAiEvaluation(job: Job, candidate: Candidate): Promise<Partial<Screening>> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey === '') {
-    return new Promise((resolve) => {
-      setTimeout(() => resolve(heuristicEval(candidate, job)), 300);
-    });
-  }
-
-  const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
-  const prompt = `You are an expert HR evaluation agent. Evaluate this candidate against the job.\n\nJOB:\nTitle: ${job.title}\nRequired Skills: ${job.requiredSkills.join(', ')}\nExperience Required: ${job.experienceYears} years\nStrictness: ${job.strictness}\n\nCANDIDATE:\nName: ${candidate.name}\nSkills: ${candidate.skills.join(', ')}\nExperience: ${candidate.experienceYears} years\nResume: ${candidate.resumeText}\n\nRespond ONLY with JSON matching this exact schema.`;
-
-  return ai.models.generateContent({
-    model: 'gemini-2.0-flash', contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          score: { type: Type.INTEGER }, tier: { type: Type.STRING },
-          reasoning: { type: Type.STRING },
-          skillMatch: { type: Type.OBJECT, properties: { matched: { type: Type.ARRAY, items: { type: Type.STRING } }, missing: { type: Type.ARRAY, items: { type: Type.STRING } }, niceToHave: { type: Type.ARRAY, items: { type: Type.STRING } } }, required: ['matched', 'missing', 'niceToHave'] },
-          experienceAlignment: { type: Type.STRING }, educationAlignment: { type: Type.STRING },
-          redFlags: { type: Type.ARRAY, items: { type: Type.STRING } },
-          biasIndicators: { type: Type.OBJECT, properties: { ageRisk: { type: Type.BOOLEAN }, genderRisk: { type: Type.BOOLEAN }, locationRisk: { type: Type.BOOLEAN }, explanation: { type: Type.STRING } }, required: ['ageRisk', 'genderRisk', 'locationRisk', 'explanation'] },
-          proposedQuestions: { type: Type.ARRAY, items: { type: Type.STRING } },
-          estimatedOnboarding: { type: Type.STRING }, strengths: { type: Type.ARRAY, items: { type: Type.STRING } }
+/**
+ * Call OpenRouter with a plain text prompt.
+ * Returns the model's text reply, or throws on HTTP error.
+ */
+async function callOpenRouter(prompt: string, maxTokens = 1000): Promise<string> {
+  const res = await fetch(OPENROUTER_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+      'Content-Type':  'application/json',
+      'HTTP-Referer':  'https://recruitai-yc07.onrender.com', // your Render URL
+      'X-Title':       'Recruit-AI',
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      max_tokens: maxTokens,
+      messages: [
+        {
+          role: 'user',
+          content: prompt,
         },
-        required: ['score', 'tier', 'reasoning', 'skillMatch', 'experienceAlignment', 'educationAlignment', 'redFlags', 'biasIndicators', 'proposedQuestions', 'estimatedOnboarding', 'strengths']
-      }
-    }
-  })
-  .then(res => { try { return JSON.parse(res.text || '{}'); } catch { return heuristicEval(candidate, job); } })
-  .catch((err: any) => {
-    console.warn('[AI FALLBACK] Using heuristic:', err?.message?.slice(0, 100));
-    return heuristicEval(candidate, job);
+      ],
+      // Ask for JSON output reliably
+      response_format: { type: 'json_object' },
+    }),
   });
-}
 
-async function getSmtpConfig() {
-  const { data } = await supabase.from('app_settings').select('value').eq('key', 'smtp').single();
-  return data?.value ?? { host: process.env.SMTP_HOST || 'smtp.gmail.com', port: parseInt(process.env.SMTP_PORT || '587'), user: process.env.SMTP_USER || '', pass: process.env.SMTP_PASS || '', from: process.env.SMTP_FROM || 'noreply@recruit-ai.com' };
-}
-
-async function dispatchEmailNotification(toEmail: string, subject: string, bodyText: string) {
-  console.log(`[EMAIL] To: ${toEmail} | ${subject}`);
-  const apiKey = process.env.BREVO_API_KEY;
-  const senderEmail = process.env.BREVO_SENDER_EMAIL || process.env.SMTP_USER || 'noreply@recruit-ai.com';
-  if (!apiKey) {
-    console.log(`[EMAIL SIM] No Brevo API key — skipping.`);
-    return { success: true, simulated: true };
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText);
+    throw Object.assign(new Error(`OpenRouter ${res.status}: ${errText}`), { status: res.status });
   }
+
+  const data = await res.json() as {
+    choices: Array<{ message: { content: string } }>;
+  };
+
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error('OpenRouter returned empty content');
+  return content.trim();
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface ParsedResume {
+  name: string;
+  email: string;
+  phone: string;
+  location: string;
+  skills: string[];
+  experienceYears: number;
+  companies: string[];
+  education: {
+    degree: string;
+    field: string;
+    school: string;
+    graduationYear: number;
+  };
+  resumeText: string;
+  parsedByFallback: boolean;
+}
+
+interface ScreeningResult {
+  score: number;
+  summary: string;
+  strengths: string[];
+  concerns: string[];
+  recommendation: 'strong_yes' | 'yes' | 'maybe' | 'no';
+  scoredByFallback: boolean;
+}
+
+// ─── Helper: extract readable text from base64 PDF ───────────────────────────
+/**
+ * Pulls ASCII printable runs from raw PDF bytes.
+ * No npm library — no ESM/CJS issues.
+ */
+function extractTextFromBase64Pdf(base64: string): string {
   try {
-    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        'api-key': apiKey,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        sender: { name: 'Recruit-AI', email: senderEmail },
-        to: [{ email: toEmail }],
-        subject,
-        textContent: bodyText
-      })
-    });
-    const data = await res.json();
-    if (res.ok) {
-      console.log(`[EMAIL OK] messageId: ${data.messageId}`);
-      return { success: true, messageId: data.messageId };
-    } else {
-      console.error(`[EMAIL ERROR]`, data);
-      return { success: false, error: data };
-    }
-  } catch (err) {
-    console.error(`[EMAIL ERROR]`, err);
-    return { success: false, error: err };
+    const buffer  = Buffer.from(base64, 'base64');
+    const raw     = buffer.toString('latin1');
+    const chunks  = raw.match(/[\x20-\x7E]{4,}/g) ?? [];
+    return chunks.join(' ').replace(/\s+/g, ' ').trim();
+  } catch {
+    return '';
   }
 }
 
-async function autoScheduleCandidateInterview(candidateId: string, jobId: string) {
-  const [{ data: candRow }, { data: jobRow }] = await Promise.all([
-    supabase.from('candidates').select('*').eq('id', candidateId).single(),
-    supabase.from('jobs').select('*').eq('id', jobId).single()
+// ─── Helper: heuristic resume parser (no AI) ─────────────────────────────────
+function heuristicParseResume(rawText: string, fileName: string): ParsedResume {
+  const text = rawText || '';
+
+  // Name — prefer filename over regex (more reliable)
+  const nameFromFile = fileName
+    .replace(/\.[^/.]+$/, '')
+    .replace(/[_\-\.]+/g, ' ')
+    .replace(/resume|cv/gi, '')
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+
+  const nameMatch = text.match(/^([A-Z][a-z]+(?: [A-Z][a-z]+){1,3})/m);
+  const name = nameMatch?.[1] || nameFromFile || 'Unknown Candidate';
+
+  // Email
+  const emailMatch = text.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+  const email = emailMatch?.[0] || '';
+
+  // Phone
+  const phoneMatch = text.match(/(\+?[\d][\d\s\-().]{7,14}\d)/);
+  const phone = phoneMatch?.[0]?.trim() || '';
+
+  // Location
+  const locationMatch = text.match(
+    /([A-Z][a-zA-Z\s]+,\s*(?:[A-Z]{2}|[A-Z][a-z]+)(?:,\s*[A-Z][a-z]+)?)/
+  );
+  const location = locationMatch?.[0] || '';
+
+  // Skills — match against curated list
+  const KNOWN_SKILLS = [
+    'JavaScript','TypeScript','Python','Java','C++','C#','Go','Rust','Ruby','PHP','Swift','Kotlin',
+    'React','Angular','Vue','Next.js','Node.js','Express','Django','Flask','FastAPI','Spring',
+    'SQL','PostgreSQL','MySQL','MongoDB','Redis','Supabase','Firebase',
+    'AWS','GCP','Azure','Docker','Kubernetes','Terraform','CI/CD','GitHub Actions',
+    'HTML','CSS','Tailwind','GraphQL','REST','gRPC',
+    'Machine Learning','Deep Learning','TensorFlow','PyTorch','NLP',
+    'Git','Linux','Agile','Scrum',
+  ];
+  const skillsSectionMatch = text.match(
+    /skills?[:\s]+([\s\S]{0,500}?)(?:\n{2,}|experience|education|projects|work|$)/i
+  );
+  const skillsRaw = skillsSectionMatch?.[1] || text;
+  const skills = KNOWN_SKILLS.filter((s) =>
+    new RegExp(`\\b${s.replace(/[.+]/g, '\\$&')}\\b`, 'i').test(skillsRaw)
+  );
+
+  // Experience years
+  const expMatches = text.match(
+    /(\d{1,2})\+?\s*(?:years?|yrs?)\s*(?:of\s*)?(?:experience|exp)/gi
+  );
+  let experienceYears = 0;
+  if (expMatches) {
+    const nums = expMatches.map((m) => parseInt(m, 10)).filter((n) => !isNaN(n) && n < 50);
+    experienceYears = nums.length ? Math.max(...nums) : 0;
+  }
+  if (experienceYears === 0) {
+    const years = text.match(/\b(19[89]\d|20[012]\d)\b/g) ?? [];
+    if (years.length >= 2) {
+      const sorted = years.map(Number).sort();
+      experienceYears = Math.min(sorted[sorted.length - 1] - sorted[0], 30);
+    }
+  }
+
+  // Companies
+  const expSection = text.match(
+    /(?:work\s*)?experience[:\s]+([\s\S]{0,800}?)(?:\n{2,}|education|skills|projects|$)/i
+  )?.[1] || '';
+  const companies = expSection
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 2 && l.length < 60 && /[A-Z]/.test(l) && !/^\d/.test(l))
+    .slice(0, 5);
+
+  // Education
+  const eduSection = text.match(
+    /education[:\s]+([\s\S]{0,400}?)(?:\n{2,}|experience|skills|projects|$)/i
+  )?.[1] || '';
+  const degreeMatch   = eduSection.match(/\b(B\.?Tech|M\.?Tech|B\.?E|M\.?E|B\.?Sc|M\.?Sc|MBA|PhD|B\.?S|M\.?S|Bachelor|Master|Associate)\b/i);
+  const schoolMatch   = eduSection.match(/([A-Z][a-zA-Z\s&]{4,50}(?:University|College|Institute|School|Academy))/);
+  const gradYearMatch = eduSection.match(/\b(19[89]\d|20[0-2]\d)\b/);
+
+  return {
+    name, email, phone, location, skills, experienceYears, companies,
+    education: {
+      degree: degreeMatch?.[1] || '',
+      field: '',
+      school: schoolMatch?.[1]?.trim() || '',
+      graduationYear: gradYearMatch ? parseInt(gradYearMatch[1]) : 0,
+    },
+    resumeText: text.slice(0, 3000),
+    parsedByFallback: true,
+  };
+}
+
+// ─── Helper: heuristic screening scorer (no AI) ───────────────────────────────
+function heuristicScreening(
+  candidate: Partial<ParsedResume>,
+  jobDescription: string
+): ScreeningResult {
+  const jd = jobDescription.toLowerCase();
+  const candidateSkills = (candidate.skills ?? []).map((s) => s.toLowerCase());
+  const resumeText      = (candidate.resumeText ?? '').toLowerCase();
+
+  const STOP_WORDS = new Set([
+    'the','and','for','with','will','have','from','this','that','are','our',
+    'you','they','not','can','all','any','but','has','was','been','more',
+    'your','their','work','team','also','into','over','such','than','then',
   ]);
-  if (!candRow || !jobRow) return;
-  const cand = mapCandidate(candRow);
-  const job = mapJob(jobRow);
 
-  const { data: existingInterviews } = await supabase.from('interviews').select('date, time');
-  const slots = ['10:00', '11:30', '14:00', '15:30'];
-  let targetDate = new Date();
-  targetDate.setDate(targetDate.getDate() + 1);
-  let scheduledDate = '', scheduledTime = '', found = false;
+  const jdTokens = [...new Set(
+    jd.match(/\b[a-z][a-z.+#]{2,}\b/g)?.filter((t) => !STOP_WORDS.has(t)) ?? []
+  )];
 
-  for (let d = 0; d < 14 && !found; d++) {
-    if (targetDate.getDay() === 0 || targetDate.getDay() === 6) { targetDate.setDate(targetDate.getDate() + 1); continue; }
-    const dateStr = targetDate.toISOString().split('T')[0];
-    for (const slot of slots) {
-      if (!(existingInterviews ?? []).some((i: any) => i.date === dateStr && i.time === slot)) {
-        scheduledDate = dateStr; scheduledTime = slot; found = true; break;
-      }
-    }
-    if (!found) targetDate.setDate(targetDate.getDate() + 1);
-  }
-  if (!found) { const d = new Date(); d.setDate(d.getDate() + 2); scheduledDate = d.toISOString().split('T')[0]; scheduledTime = '11:00'; }
+  const matchedSkills = candidateSkills.filter((s) =>
+    jdTokens.some((t) => s.includes(t) || t.includes(s))
+  );
 
-  const hash = Math.random().toString(36).substring(2, 12);
-  const meetLink = `https://meet.google.com/meet-${hash.slice(0,3)}-${hash.slice(3,7)}-${hash.slice(7,10)}`;
-  const newInterview = { id: `int-${Date.now()}`, candidate_id: candidateId, job_id: jobId, date: scheduledDate, time: scheduledTime, type: 'video', interviewer: 'Staff AI Systems Recruiter', status: 'scheduled', meeting_link: meetLink };
-  await supabase.from('interviews').insert(newInterview);
+  const skillScore = jdTokens.length > 0
+    ? Math.min(100, Math.round((matchedSkills.length / Math.min(jdTokens.length, 15)) * 100))
+    : 50;
 
-  const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', candidateId).eq('job_id', jobId).single();
-  if (pRow) {
-    const history = [...(pRow.stage_history ?? []), { stage: 'interview', changedAt: new Date().toISOString(), changedBy: 'AI Recruiter Bot', notes: 'Auto-scheduled interview.' }];
-    await supabase.from('pipeline').update({ current_stage: 'interview', stage_history: history }).eq('candidate_id', candidateId).eq('job_id', jobId);
-  }
+  const expRequired = (() => {
+    const m = jd.match(/(\d+)\+?\s*years?/);
+    return m ? parseInt(m[1]) : 0;
+  })();
+  const expScore = expRequired === 0
+    ? 70
+    : (candidate.experienceYears ?? 0) >= expRequired
+    ? 100
+    : Math.round(((candidate.experienceYears ?? 0) / expRequired) * 100);
 
-  const subject = `Technical Interview Scheduled: ${job.title}`;
-  const body = `Hi ${cand.name},\n\nYour screening score qualifies you for a technical interview for "${job.title}".\n\n📅 Date: ${scheduledDate}\n⏰ Time: ${scheduledTime}\n💻 Meet: ${meetLink}\n\nWarm regards,\nRecruit-AI`;
-  await dispatchEmailNotification(cand.email, subject, body);
-  await supabase.from('communications').insert({ id: `comm-sched-${Date.now()}`, candidate_id: candidateId, job_id: jobId, type: 'email', subject, body, status: 'sent', sent_at: new Date().toISOString() });
+  const keywordHits  = jdTokens.filter((t) => resumeText.includes(t)).length;
+  const keywordScore = jdTokens.length > 0
+    ? Math.min(100, Math.round((keywordHits / Math.min(jdTokens.length, 20)) * 100))
+    : 50;
+
+  const score = Math.round(skillScore * 0.5 + expScore * 0.3 + keywordScore * 0.2);
+
+  const strengths: string[] = [];
+  const concerns:  string[] = [];
+
+  if (matchedSkills.length > 0)
+    strengths.push(`Matched skills: ${matchedSkills.slice(0, 5).join(', ')}`);
+  if ((candidate.experienceYears ?? 0) >= expRequired && expRequired > 0)
+    strengths.push(`Meets experience requirement (${candidate.experienceYears} yr(s))`);
+  if (matchedSkills.length === 0)
+    concerns.push('No direct skill matches found in resume');
+  if (expRequired > 0 && (candidate.experienceYears ?? 0) < expRequired)
+    concerns.push(`Experience below requirement (${candidate.experienceYears ?? 0} vs ${expRequired} yr(s))`);
+  if (!candidate.email)
+    concerns.push('Email not extracted — manual review recommended');
+
+  const recommendation: ScreeningResult['recommendation'] =
+    score >= 75 ? 'strong_yes' :
+    score >= 55 ? 'yes' :
+    score >= 35 ? 'maybe' : 'no';
+
+  return {
+    score,
+    summary: `Heuristic screening score: ${score}/100. ${
+      strengths.length ? 'Strengths: ' + strengths[0] + '. ' : ''
+    }${concerns.length ? 'Note: ' + concerns[0] + '.' : ''}`,
+    strengths, concerns, recommendation,
+    scoredByFallback: true,
+  };
 }
 
-function startServer() {
-  const app = express();
-  const PORT = 3000;
-  app.use(express.json({ limit: '20mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+// ─── /api/parse-resume ────────────────────────────────────────────────────────
+/**
+ * POST /api/parse-resume
+ * Body: { fileBase64: string, fileName: string }
+ *
+ * Flow: extract text from PDF → send text to OpenRouter → heuristic fallback
+ * ALWAYS returns HTTP 200 + ParsedResume JSON.
+ *
+ * Note: OpenRouter's free Llama model is text-only (no native PDF).
+ * We extract text from the PDF first, then send that text to the model.
+ */
+app.post('/api/parse-resume', async (req: Request, res: Response) => {
+  const { fileBase64, fileName } = req.body as { fileBase64?: string; fileName?: string };
+  const safeFileName = fileName || 'resume.pdf';
 
-  // ── STATUS ────────────────────────────────────────────────────────────────
-  app.get('/api/status', (req, res) => {
-    const hasKey = !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY';
-    res.json({ configured: hasKey, mode: hasKey ? 'Production Gemini (Live)' : 'Simulation (Heuristic Fallback)' });
-  });
+  if (!fileBase64) {
+    console.warn('[PARSE-RESUME] No fileBase64 received');
+    return res.status(200).json({
+      name: safeFileName.replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' '),
+      email: '', phone: '', location: '',
+      skills: [], experienceYears: 0, companies: [],
+      education: { degree: '', field: '', school: '', graduationYear: 0 },
+      resumeText: '',
+      parsedByFallback: true,
+    } satisfies ParsedResume);
+  }
 
-  // ── PARSE RESUME (Gemini reads PDF natively — no extra libraries needed) ──
-  app.post('/api/parse-resume', async (req, res) => {
+  // Step 1 — extract text from PDF bytes (no library needed)
+  const rawText = extractTextFromBase64Pdf(fileBase64);
+
+  if (!rawText || rawText.length < 50) {
+    console.warn('[PARSE-RESUME] Could not extract readable text from PDF, using heuristic only');
+    return res.status(200).json(heuristicParseResume(rawText, safeFileName));
+  }
+
+  // Step 2 — try OpenRouter
+  if (OPENROUTER_API_KEY) {
     try {
-      const { fileBase64, fileName } = req.body;
-      if (!fileBase64) return res.status(400).json({ error: 'No file data provided' });
+      const prompt = `You are a resume parser. Extract structured data from the resume text below.
+Return ONLY a valid JSON object — no markdown, no explanation, no backticks.
 
-      const apiKey = process.env.GEMINI_API_KEY;
-
-      // No Gemini key — return name from filename only
-      if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-        const cleanName = (fileName || 'Candidate')
-          .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
-          .replace(/\b\w/g, (c: string) => c.toUpperCase());
-        return res.json({
-          name: cleanName, email: '', phone: '', location: '',
-          skills: [], experienceYears: 0, companies: [],
-          education: { degree: '', field: '', school: '', graduationYear: 0 },
-          resumeText: `Resume: ${fileName}`
-        });
-      }
-
-      // Send PDF base64 directly to Gemini — it reads PDFs natively
-      const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
-
-      const prompt = `You are a resume parser. Read this PDF resume carefully and extract all candidate information.
-Return ONLY a valid JSON object. No markdown, no backticks, no explanation — just JSON.
-
+Use exactly this structure (use empty string or 0 for missing fields, empty array for missing lists):
 {
-  "name": "candidate full name",
-  "email": "email address or empty string",
-  "phone": "phone number or empty string",
-  "location": "city and country or empty string",
-  "skills": ["actual", "skills", "from", "resume"],
-  "experienceYears": 0,
-  "companies": [{"company": "name", "role": "title", "duration": "X years"}],
-  "education": {"degree": "degree type", "field": "field of study", "school": "institution", "graduationYear": 2020},
-  "resumeText": "complete text content of the resume"
+  "name": "Full Name",
+  "email": "email@example.com",
+  "phone": "+1234567890",
+  "location": "City, State",
+  "skills": ["skill1", "skill2"],
+  "experienceYears": 3,
+  "companies": ["Company A", "Company B"],
+  "education": {
+    "degree": "B.Tech",
+    "field": "Computer Science",
+    "school": "University Name",
+    "graduationYear": 2022
+  },
+  "resumeText": "first 300 chars of the resume text"
 }
 
-Rules:
-- Extract ONLY what is actually written in the resume — never invent anything
-- skills = real technical skills, tools, frameworks, languages listed in the resume
-- experienceYears = total years of professional work experience
-- If a field is missing use empty string or 0`;
+RESUME TEXT:
+${rawText.slice(0, 4000)}`;
 
-      const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { inlineData: { mimeType: 'application/pdf', data: fileBase64 } },
-              { text: prompt }
-            ]
-          }
-        ]
-      });
+      const raw    = await callOpenRouter(prompt, 800);
+      const clean  = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+      const parsed = JSON.parse(clean) as ParsedResume;
+      parsed.parsedByFallback = false;
 
-      let parsed: any = {};
-      try {
-        const text = (result.text || '').replace(/```json|```/g, '').trim();
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = {};
-      }
+      console.log('[PARSE-RESUME] OpenRouter succeeded for', safeFileName);
+      return res.status(200).json(parsed);
 
-      console.log(`[PARSE-RESUME OK] ${parsed.name || fileName}`);
-      res.json({
-        name: parsed.name || 'Unknown Candidate',
-        email: parsed.email || '',
-        phone: parsed.phone || '',
-        location: parsed.location || '',
-        skills: Array.isArray(parsed.skills) ? parsed.skills : [],
-        experienceYears: Number(parsed.experienceYears) || 0,
-        companies: Array.isArray(parsed.companies) ? parsed.companies : [],
-        education: parsed.education || { degree: '', field: '', school: '', graduationYear: 0 },
-        resumeText: parsed.resumeText || ''
-      });
-    } catch (err: any) {
-      console.warn('[PARSE-RESUME FALLBACK]', err.message?.slice(0, 80));
-      // Always return something usable — never crash the upload
-      const cleanName = (fileName || 'Candidate')
-        .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
-        .replace(/\b\w/g, (c: string) => c.toUpperCase());
-      res.json({
-        name: cleanName, email: '', phone: '', location: '',
-        skills: [], experienceYears: 0, companies: [],
-        education: { degree: '', field: '', school: '', graduationYear: 0 },
-        resumeText: `Resume: ${fileName}`
-      });
+    } catch (err: unknown) {
+      const status = (err as { status?: number }).status;
+      console.warn(`[PARSE-RESUME FALLBACK] OpenRouter failed (status ${status ?? 'unknown'}), running heuristics`);
     }
-  });
-
-
-  // ── JOBS ──────────────────────────────────────────────────────────────────
-  app.get('/api/jobs', async (req, res) => {
-    const { data, error } = await supabase.from('jobs').select('*').order('created_at', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json((data ?? []).map(mapJob));
-  });
-
-  app.post('/api/jobs', async (req, res) => {
-    const b = req.body;
-    const row = { id: `job-${Date.now()}`, title: b.title || 'Untitled Job', department: b.department || 'General', location: b.location || 'Remote', description: b.description || '', required_skills: b.requiredSkills ?? [], nice_to_have_skills: b.niceToHaveSkills ?? [], experience_years: Number(b.experienceYears) || 0, salary_min: Number(b.salaryMin) || 0, salary_max: Number(b.salaryMax) || 0, currency: 'USD', status: 'active', created_at: new Date().toISOString(), strictness: Number(b.strictness) || 50, weights: b.weights ?? { skills: 40, experience: 35, education: 15, other: 10 } };
-    const { data, error } = await supabase.from('jobs').insert(row).select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    res.status(201).json(mapJob(data));
-  });
-
-  app.put('/api/jobs/:id', async (req, res) => {
-    const b = req.body;
-    const updates: any = {};
-    if (b.title !== undefined) updates.title = b.title;
-    if (b.department !== undefined) updates.department = b.department;
-    if (b.location !== undefined) updates.location = b.location;
-    if (b.description !== undefined) updates.description = b.description;
-    if (b.requiredSkills !== undefined) updates.required_skills = b.requiredSkills;
-    if (b.niceToHaveSkills !== undefined) updates.nice_to_have_skills = b.niceToHaveSkills;
-    if (b.experienceYears !== undefined) updates.experience_years = b.experienceYears;
-    if (b.salaryMin !== undefined) updates.salary_min = b.salaryMin;
-    if (b.salaryMax !== undefined) updates.salary_max = b.salaryMax;
-    if (b.status !== undefined) updates.status = b.status;
-    if (b.strictness !== undefined) updates.strictness = b.strictness;
-    if (b.weights !== undefined) updates.weights = b.weights;
-    const { data, error } = await supabase.from('jobs').update(updates).eq('id', req.params.id).select().single();
-    if (error) return res.status(404).json({ error: 'Job not found' });
-    res.json(mapJob(data));
-  });
-
-  app.delete('/api/jobs/:id', async (req, res) => {
-    const { id } = req.params;
-    await supabase.from('pipeline').delete().eq('job_id', id);
-    await supabase.from('interviews').delete().eq('job_id', id);
-    await supabase.from('screenings').delete().eq('job_id', id);
-    await supabase.from('communications').delete().eq('job_id', id);
-    const { error } = await supabase.from('jobs').delete().eq('id', id);
-    if (error) return res.status(404).json({ error: 'Job not found' });
-    res.json({ success: true, message: 'Job and all associated records deleted.' });
-  });
-
-  // ── CANDIDATES ────────────────────────────────────────────────────────────
-  app.get('/api/candidates', async (req, res) => {
-    const { data, error } = await supabase.from('candidates').select('*').order('uploaded_at', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json((data ?? []).map(mapCandidate));
-  });
-
-  app.post('/api/candidates', async (req, res) => {
-    const b = req.body;
-    const id = `cand-${Date.now()}`;
-    const row = { id, name: b.name || 'Anonymous', email: b.email || '', phone: b.phone || '', location: b.location || 'Remote', skills: b.skills ?? [], experience_years: Number(b.experienceYears) || 0, companies: b.companies ?? [], education: b.education ?? { degree: 'N/A', field: 'N/A', school: 'N/A', graduationYear: 2024 }, resume_text: b.resumeText || '', uploaded_at: new Date().toISOString(), resume_file_name: b.resumeFileName || 'Uploaded_Resume.pdf' };
-    const { data, error } = await supabase.from('candidates').insert(row).select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    const jobId = b.jobId || (await supabase.from('jobs').select('id').limit(1).single()).data?.id || '';
-    const pipeRow = { candidate_id: id, job_id: jobId, current_stage: 'applied', stage_history: [{ stage: 'applied', changedAt: new Date().toISOString(), changedBy: 'System', notes: 'Application registered.' }], decision: 'pending' };
-    const { data: pData } = await supabase.from('pipeline').insert(pipeRow).select().single();
-    res.status(201).json({ candidate: mapCandidate(data), pipeline: pData ? mapPipeline(pData) : null });
-  });
-
-  app.post('/api/candidates/bulk', async (req, res) => {
-    const { list, jobId } = req.body;
-    if (!Array.isArray(list)) return res.status(400).json({ error: 'list must be an array' });
-    const jobFallback = jobId || (await supabase.from('jobs').select('id').limit(1).single()).data?.id || '';
-    const candRows = list.map((item: any, i: number) => ({ id: `cand-${Date.now()}-${i}`, name: item.name || `Batch #${i+1}`, email: item.email || `batch${i}@recruit-ai.org`, phone: item.phone || '', location: item.location || 'Remote', skills: item.skills ?? [], experience_years: Number(item.experienceYears) || 3, companies: item.companies ?? [], education: item.education ?? { degree: 'Bachelor', field: 'Engineering', school: 'Tech Institute', graduationYear: 2022 }, resume_text: item.resumeText || '', uploaded_at: new Date().toISOString(), resume_file_name: item.resumeFileName || `CV_Batch_${i+1}.pdf` }));
-    const { data: inserted, error } = await supabase.from('candidates').insert(candRows).select();
-    if (error) return res.status(500).json({ error: error.message });
-    const pipeRows = candRows.map(c => ({ candidate_id: c.id, job_id: jobFallback, current_stage: 'applied', stage_history: [{ stage: 'applied', changedAt: new Date().toISOString(), changedBy: 'Batch Importer', notes: 'Bulk processed.' }], decision: 'pending' }));
-    const { data: pInserted } = await supabase.from('pipeline').insert(pipeRows).select();
-    res.status(201).json({ candidates: (inserted ?? []).map(mapCandidate), pipelines: (pInserted ?? []).map(mapPipeline) });
-  });
-
-  app.post('/api/candidates/:id/blacklist', async (req, res) => {
-    const { id } = req.params;
-    const { reason, blacklist } = req.body;
-    const isBlacklisted = blacklist !== false;
-    const { data, error } = await supabase.from('candidates').update({ blacklisted: isBlacklisted, blacklist_reason: isBlacklisted ? (reason || 'Flagged for recruitment violation') : '' }).eq('id', id).select().single();
-    if (error) return res.status(404).json({ error: 'Candidate not found' });
-    if (isBlacklisted) {
-      const { data: pipes } = await supabase.from('pipeline').select('*').eq('candidate_id', id);
-      for (const p of pipes ?? []) {
-        const history = [...(p.stage_history ?? []), { stage: 'rejected', changedAt: new Date().toISOString(), changedBy: 'System Security', notes: `Blacklisted: ${reason}` }];
-        await supabase.from('pipeline').update({ current_stage: 'rejected', decision: 'rejected', stage_history: history }).eq('candidate_id', id).eq('job_id', p.job_id);
-      }
-    }
-    res.json(mapCandidate(data));
-  });
-
-  // ✅ EDIT candidate (name, email, phone)
-  app.put('/api/candidates/:id', async (req, res) => {
-    const { id } = req.params;
-    const updates: any = {};
-    if (req.body.email) updates.email = req.body.email;
-    if (req.body.name) updates.name = req.body.name;
-    if (req.body.phone) updates.phone = req.body.phone;
-    const { data, error } = await supabase.from('candidates').update(updates).eq('id', id).select().single();
-    if (error) return res.status(404).json({ error: 'Candidate not found' });
-    res.json(mapCandidate(data));
-  });
-
-  // ✅ DELETE candidate + all related records
-  app.delete('/api/candidates/:id', async (req, res) => {
-    const { id } = req.params;
-    await supabase.from('pipeline').delete().eq('candidate_id', id);
-    await supabase.from('interviews').delete().eq('candidate_id', id);
-    await supabase.from('screenings').delete().eq('candidate_id', id);
-    await supabase.from('communications').delete().eq('candidate_id', id);
-    const { error } = await supabase.from('candidates').delete().eq('id', id);
-    if (error) return res.status(404).json({ error: 'Candidate not found' });
-    res.json({ success: true, message: 'Candidate and all records deleted.' });
-  });
-
-  // ── SCREENINGS ────────────────────────────────────────────────────────────
-  app.get('/api/screenings', async (req, res) => {
-    const { data, error } = await supabase.from('screenings').select('*');
-    if (error) return res.status(500).json({ error: error.message });
-    res.json((data ?? []).map(mapScreening));
-  });
-
-  app.post('/api/screenings/evaluate', async (req, res) => {
-    const { candidateId, jobId } = req.body;
-    const [{ data: jobRow }, { data: candRow }] = await Promise.all([
-      supabase.from('jobs').select('*').eq('id', jobId).single(),
-      supabase.from('candidates').select('*').eq('id', candidateId).single()
-    ]);
-    if (!jobRow || !candRow) return res.status(404).json({ error: 'Job or Candidate not found' });
-    const job = mapJob(jobRow);
-    const candidate = mapCandidate(candRow);
-
-    try {
-      const result = await runAiEvaluation(job, candidate);
-      const screenRow = { id: `scr-${Date.now()}`, candidate_id: candidateId, job_id: jobId, score: result.score ?? 70, tier: result.tier ?? 'consider', reasoning: result.reasoning ?? '', skill_match: result.skillMatch ?? { matched: [], missing: [], niceToHave: [] }, experience_alignment: result.experienceAlignment ?? '', education_alignment: result.educationAlignment ?? '', red_flags: result.redFlags ?? [], bias_indicators: result.biasIndicators ?? {}, proposed_questions: result.proposedQuestions ?? [], estimated_onboarding: result.estimatedOnboarding ?? 'Moderate', strengths: result.strengths ?? [], screened_at: new Date().toISOString() };
-      await supabase.from('screenings').delete().eq('candidate_id', candidateId).eq('job_id', jobId);
-      const { data: scrData } = await supabase.from('screenings').insert(screenRow).select().single();
-
-      const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', candidateId).eq('job_id', jobId).single();
-      if (pRow) {
-        let stage: PipelineStage = 'screening';
-        let note = `AI Score: ${screenRow.score}. `;
-        if (screenRow.score >= 75) { stage = 'shortlisted'; note += 'Auto-Shortlisted (score ≥ 75).'; }
-        else if (screenRow.score < 40) { stage = 'rejected'; note += 'Below threshold — rejected.'; }
-        const history = [...(pRow.stage_history ?? []), { stage, changedAt: new Date().toISOString(), changedBy: 'AI Recruiter Bot', notes: note }];
-        await supabase.from('pipeline').update({ current_stage: stage, stage_history: history }).eq('candidate_id', candidateId).eq('job_id', jobId);
-
-        const subject = stage === 'shortlisted' ? `Shortlisted: ${job.title}` : `Application Update: ${job.title}`;
-        const body = stage === 'shortlisted'
-          ? `Hi ${candidate.name},\n\nYou scored ${screenRow.score}% and have been shortlisted for ${job.title}. We'll be in touch shortly.`
-          : `Hi ${candidate.name},\n\nThank you for applying. We've decided to move forward with other candidates at this time.`;
-        dispatchEmailNotification(candidate.email, subject, body);
-        await supabase.from('communications').insert({ id: `comm-${Date.now()}`, candidate_id: candidateId, job_id: jobId, type: 'email', subject, body, status: 'sent', sent_at: new Date().toISOString() });
-        if (stage === 'shortlisted') await autoScheduleCandidateInterview(candidateId, jobId);
-      }
-      res.status(200).json({ screening: scrData ? mapScreening(scrData) : screenRow });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Evaluation failure' });
-    }
-  });
-
-  // ── PIPELINE ──────────────────────────────────────────────────────────────
-  app.get('/api/pipeline', async (req, res) => {
-    const { data, error } = await supabase.from('pipeline').select('*');
-    if (error) return res.status(500).json({ error: error.message });
-    res.json((data ?? []).map(mapPipeline));
-  });
-
-  async function updatePipelineStage(candidateId: string, jobId: string, stage: PipelineStage, notes: string, updater: string, res: any) {
-    const { data: pRow, error } = await supabase.from('pipeline').select('*').eq('candidate_id', candidateId).eq('job_id', jobId).single();
-    if (error || !pRow) return res.status(404).json({ error: 'Pipeline record not found' });
-    const history = [...(pRow.stage_history ?? []), { stage, changedAt: new Date().toISOString(), changedBy: updater || 'Admin', notes: notes || `Moved to ${stage}` }];
-    const updates: any = { current_stage: stage, stage_history: history };
-    if (stage === 'hired') { updates.decision = 'approved'; updates.hire_date = new Date().toISOString(); }
-    else if (stage === 'rejected') { updates.decision = 'rejected'; }
-    const { data: updated } = await supabase.from('pipeline').update(updates).eq('candidate_id', candidateId).eq('job_id', jobId).select().single();
-
-    const [{ data: candRow }, { data: jobRow }] = await Promise.all([
-      supabase.from('candidates').select('name, email').eq('id', candidateId).single(),
-      supabase.from('jobs').select('title').eq('id', jobId).single()
-    ]);
-    if (candRow && jobRow) {
-      const subject = `Status Update: ${jobRow.title}`;
-      const body = `Hi ${candRow.name},\n\nYour application for ${jobRow.title} has moved to: ${stage.toUpperCase()}.\n\nNotes: "${notes || 'Under review.'}"\n\nWarm regards,\nRecruit-AI`;
-      dispatchEmailNotification(candRow.email, subject, body);
-      await supabase.from('communications').insert({ id: `comm-${Date.now()}`, candidate_id: candidateId, job_id: jobId, type: 'email', subject, body, status: 'sent', sent_at: new Date().toISOString() });
-    }
-    res.json(updated ? mapPipeline(updated) : {});
-  }
-
-  app.put('/api/pipeline/:candidateId/:jobId', (req, res) => {
-    const { candidateId, jobId } = req.params;
-    const { stage, notes, updater } = req.body;
-    return updatePipelineStage(candidateId, jobId, stage, notes, updater, res);
-  });
-
-  app.post('/api/pipeline/stage', (req, res) => {
-    const { candidateId, jobId, stage, notes, updater } = req.body;
-    return updatePipelineStage(candidateId, jobId, stage, notes, updater, res);
-  });
-
-  // ── COMMUNICATIONS ────────────────────────────────────────────────────────
-  app.get('/api/communications', async (req, res) => {
-    const { data, error } = await supabase.from('communications').select('*').order('sent_at', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json((data ?? []).map(mapCommunication));
-  });
-
-  app.post('/api/communications', async (req, res) => {
-    const b = req.body;
-    const row = { id: `comm-${Date.now()}`, candidate_id: b.candidateId, job_id: b.jobId, type: b.type || 'email', subject: b.subject || 'No Subject', body: b.body || '', status: 'sent', sent_at: new Date().toISOString() };
-    const { data, error } = await supabase.from('communications').insert(row).select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    res.status(201).json(mapCommunication(data));
-  });
-
-  // ── INTERVIEWS ────────────────────────────────────────────────────────────
-  app.get('/api/interviews', async (req, res) => {
-    const { data, error } = await supabase.from('interviews').select('*');
-    if (error) return res.status(500).json({ error: error.message });
-    res.json((data ?? []).map(mapInterview));
-  });
-
-  app.post('/api/interviews', async (req, res) => {
-    const b = req.body;
-    const row = { id: `int-${Date.now()}`, candidate_id: b.candidateId, job_id: b.jobId, date: b.date || new Date().toISOString().split('T')[0], time: b.time || '12:00', type: b.type || 'video', interviewer: b.interviewer || 'Recruiter', status: 'scheduled', meeting_link: b.meetingLink || 'https://meet.google.com/meet-link' };
-    const { data, error } = await supabase.from('interviews').insert(row).select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', b.candidateId).eq('job_id', b.jobId).single();
-    if (pRow && pRow.current_stage !== 'interview') {
-      const history = [...(pRow.stage_history ?? []), { stage: 'interview', changedAt: new Date().toISOString(), changedBy: 'Admin Scheduler', notes: `Interview on ${row.date} at ${row.time}` }];
-      await supabase.from('pipeline').update({ current_stage: 'interview', stage_history: history }).eq('candidate_id', b.candidateId).eq('job_id', b.jobId);
-    }
-    res.status(201).json(mapInterview(data));
-  });
-
-  app.post('/api/interviews/:id/feedback', async (req, res) => {
-    const { rating, feedback } = req.body;
-    const { data, error } = await supabase.from('interviews').update({ status: 'completed', rating: Number(rating) || 5, feedback }).eq('id', req.params.id).select().single();
-    if (error) return res.status(404).json({ error: 'Interview not found' });
-    const int = mapInterview(data);
-    const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', int.candidateId).eq('job_id', int.jobId).single();
-    if (pRow) {
-      const history = [...(pRow.stage_history ?? []), { stage: 'interview', changedAt: new Date().toISOString(), changedBy: int.interviewer, notes: `Interview done. Rating: ${rating}/5. ${feedback}` }];
-      await supabase.from('pipeline').update({ interview_feedback: feedback, stage_history: history }).eq('candidate_id', int.candidateId).eq('job_id', int.jobId);
-    }
-    res.json(int);
-  });
-
-  // ── GMAIL ─────────────────────────────────────────────────────────────────
-  app.get('/api/gmail/status', async (req, res) => {
-    const { data } = await supabase.from('app_settings').select('value').eq('key', 'gmail').single();
-    res.json(data?.value ?? { connected: false, email: '' });
-  });
-
-  app.post('/api/gmail/connect', async (req, res) => {
-    const val = { connected: true, email: req.body.email || '' };
-    await supabase.from('app_settings').upsert({ key: 'gmail', value: val });
-    res.json({ success: true, ...val });
-  });
-
-  app.post('/api/gmail/disconnect', async (req, res) => {
-    await supabase.from('app_settings').upsert({ key: 'gmail', value: { connected: false, email: '' } });
-    res.json({ success: true, connected: false, email: '' });
-  });
-
-  app.post('/api/gmail/send-custom', async (req, res) => {
-    const { candidateId, jobId, subject, body } = req.body;
-    const { data: gmailRow } = await supabase.from('app_settings').select('value').eq('key', 'gmail').single();
-    const connected = gmailRow?.value?.connected ?? false;
-    const row = { id: `comm-${Date.now()}`, candidate_id: candidateId, job_id: jobId, type: 'email', subject: subject || 'Recruitment Update', body: body || '', status: connected ? 'sent' : 'pending', sent_at: new Date().toISOString() };
-    const { data } = await supabase.from('communications').insert(row).select().single();
-    res.status(201).json({ success: true, message: connected ? 'Email dispatched!' : 'Email queued.', comm: data ? mapCommunication(data) : null });
-  });
-
-  // ── SMTP ──────────────────────────────────────────────────────────────────
-  app.get('/api/smtp/config', async (req, res) => {
-    const cfg = await getSmtpConfig();
-    res.json({ host: cfg.host, port: cfg.port, user: cfg.user, hasPassword: !!cfg.pass, from: cfg.from });
-  });
-
-  app.post('/api/smtp/config', async (req, res) => {
-    const { host, port, user, pass, from } = req.body;
-    const current = await getSmtpConfig();
-    const updated = { host: host ?? current.host, port: Number(port) || current.port, user: user ?? current.user, pass: pass ?? current.pass, from: from ?? current.from };
-    await supabase.from('app_settings').upsert({ key: 'smtp', value: updated });
-    res.json({ success: true, message: 'SMTP config updated.' });
-  });
-
-  // ── ANALYTICS ─────────────────────────────────────────────────────────────
-  app.get('/api/analytics', async (req, res) => {
-    const jobId = req.query.jobId as string;
-    let query = supabase.from('pipeline').select('*');
-    if (jobId) query = query.eq('job_id', jobId);
-    const { data: pipes } = await query;
-    const p = pipes ?? [];
-    const total = p.length;
-    const count = (stages: string[]) => p.filter(x => stages.includes(x.current_stage)).length;
-    res.json({
-      jobId: jobId || 'all', totalApplications: total,
-      funnel: { applied: total, screening: count(['screening','shortlisted','interview','offer','hired','rejected']), shortlisted: count(['shortlisted','interview','offer','hired']), interview: count(['interview','offer','hired']), offer: count(['offer','hired']), hired: count(['hired']), rejected: count(['rejected']) },
-      rates: { shortlistRate: total ? Math.round((count(['shortlisted','interview','offer','hired']) / total) * 100) : 0, interviewRate: count(['shortlisted','interview','offer','hired']) ? Math.round((count(['interview','offer','hired']) / count(['shortlisted','interview','offer','hired'])) * 100) : 0, hireRate: total ? Math.round((count(['hired']) / total) * 100) : 0 },
-      sources: [{ name: 'LinkedIn', count: Math.ceil(total * 0.45) }, { name: 'Direct Upload', count: Math.ceil(total * 0.25) }, { name: 'Indeed', count: Math.ceil(total * 0.20) }, { name: 'Referral', count: Math.ceil(total * 0.10) }],
-      averageTimeToHire: 14
-    });
-  });
-
-  // ── STATIC / VITE ─────────────────────────────────────────────────────────
-  if (process.env.NODE_ENV !== 'production') {
-    createViteServer({ server: { middlewareMode: true }, appType: 'spa' }).then((vite) => {
-      app.use(vite.middlewares);
-      app.get('*', (req, res) => res.sendFile(path.resolve(process.cwd(), 'index.html')));
-      app.listen(PORT, '0.0.0.0', () => console.log(`Dev server: http://localhost:${PORT}`));
-    });
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
-    app.listen(PORT, '0.0.0.0', () => console.log(`Production server: http://localhost:${PORT}`));
+    console.warn('[PARSE-RESUME] No OPENROUTER_API_KEY set, using heuristics');
   }
+
+  // Step 3 — heuristic fallback (always succeeds)
+  console.log('[PARSE-RESUME] Using heuristic parser for', safeFileName);
+  return res.status(200).json(heuristicParseResume(rawText, safeFileName));
+});
+
+// ─── runAiEvaluation ──────────────────────────────────────────────────────────
+/**
+ * Score a candidate against a job description.
+ * Tries OpenRouter first; falls back to heuristicScreening on any error.
+ * NEVER throws.
+ */
+async function runAiEvaluation(
+  candidate: Partial<ParsedResume>,
+  jobDescription: string
+): Promise<ScreeningResult> {
+
+  if (OPENROUTER_API_KEY) {
+    try {
+      const prompt = `You are a senior technical recruiter. Score this candidate for the job below.
+Return ONLY a valid JSON object — no markdown, no explanation, no backticks.
+
+Use exactly this structure:
+{
+  "score": <integer 0-100>,
+  "summary": "<2-3 sentence summary of fit>",
+  "strengths": ["strength1", "strength2"],
+  "concerns": ["concern1", "concern2"],
+  "recommendation": "<strong_yes|yes|maybe|no>"
 }
 
-// Keep-alive ping every 10 mins
-setInterval(() => {
-  fetch('https://recruitai-yc07.onrender.com/api/status')
-    .then(() => console.log('[Keep-alive] pinged'))
-    .catch(() => {});
-}, 10 * 60 * 1000);
+JOB DESCRIPTION:
+${jobDescription.slice(0, 1500)}
 
-startServer();
+CANDIDATE PROFILE:
+Name: ${candidate.name || 'Unknown'}
+Skills: ${(candidate.skills ?? []).join(', ') || 'None listed'}
+Experience: ${candidate.experienceYears ?? 0} years
+Companies: ${(candidate.companies ?? []).join(', ') || 'None listed'}
+Education: ${candidate.education?.degree || ''} ${candidate.education?.field || ''} — ${candidate.education?.school || ''}
+Resume excerpt: ${(candidate.resumeText ?? '').slice(0, 800)}`;
+
+      const raw    = await callOpenRouter(prompt, 600);
+      const clean  = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+      const parsed = JSON.parse(clean) as ScreeningResult;
+      parsed.scoredByFallback = false;
+
+      console.log('[SCREENING] OpenRouter succeeded for', candidate.name);
+      return parsed;
+
+    } catch (err: unknown) {
+      const status = (err as { status?: number }).status;
+      console.warn(`[SCREENING FALLBACK] OpenRouter failed (status ${status ?? 'unknown'}), using heuristic scoring`);
+    }
+  } else {
+    console.warn('[SCREENING] No OPENROUTER_API_KEY set, using heuristic scoring');
+  }
+
+  return heuristicScreening(candidate, jobDescription);
+}
+
+// ─── /api/screen-candidate ────────────────────────────────────────────────────
+/**
+ * POST /api/screen-candidate
+ * Body: { candidate: Partial<ParsedResume>, jobDescription: string }
+ * Always returns 200 + ScreeningResult.
+ */
+app.post('/api/screen-candidate', async (req: Request, res: Response) => {
+  const { candidate, jobDescription } = req.body as {
+    candidate?: Partial<ParsedResume>;
+    jobDescription?: string;
+  };
+
+  if (!candidate || !jobDescription) {
+    return res.status(400).json({ error: 'candidate and jobDescription are required' });
+  }
+
+  const result = await runAiEvaluation(candidate, jobDescription);
+  return res.status(200).json(result);
+});
+
+// ─── Health check ─────────────────────────────────────────────────────────────
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.status(200).json({
+    status: 'ok',
+    aiProvider: 'openrouter',
+    model: OPENROUTER_MODEL,
+    keyConfigured: !!OPENROUTER_API_KEY,
+  });
+});
+
+// ─── Keep all your other existing routes below ────────────────────────────────
+// e.g. app.get('/api/candidates', ...)
+//      app.post('/api/candidates', ...)
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`[SERVER] Running on port ${PORT}`);
+  console.log(`[SERVER] AI provider: OpenRouter — ${OPENROUTER_MODEL}`);
+  console.log(`[SERVER] API key configured: ${!!OPENROUTER_API_KEY}`);
+});
+
+export { app, runAiEvaluation, heuristicParseResume, heuristicScreening };
