@@ -2,11 +2,9 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
+import pdfParse from 'pdf-parse';
 import { Job, Candidate, Screening, PipelineItem, PipelineStage, Communication, Interview } from './src/types';
-import nodemailer from 'nodemailer';
-
 
 dotenv.config();
 
@@ -15,6 +13,9 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY!
 );
 
+const PUBLIC_URL = process.env.PUBLIC_URL || 'https://recruitai-yc07.onrender.com';
+
+// ── MAPPERS ─────────────────────────────────────────────────────────────────
 function mapJob(r: any): Job {
   return {
     id: r.id, title: r.title, department: r.department, location: r.location,
@@ -76,7 +77,7 @@ function mapInterview(r: any): Interview {
   };
 }
 
-
+// ── HEURISTIC EVALUATION FALLBACK ───────────────────────────────────────────
 function heuristicEval(candidate: Candidate, job: Job): Partial<Screening> {
   const matched = candidate.skills.filter(s => job.requiredSkills.some(rs => rs.toLowerCase() === s.toLowerCase()));
   const missing = job.requiredSkills.filter(rs => !candidate.skills.some(s => s.toLowerCase() === rs.toLowerCase()));
@@ -102,17 +103,11 @@ function heuristicEval(candidate: Candidate, job: Job): Partial<Screening> {
   };
 }
 
+// ── AI EVALUATION (OpenRouter) ──────────────────────────────────────────────
 function runAiEvaluation(job: Job, candidate: Candidate): Promise<Partial<Screening>> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey === '') {
-    return new Promise((resolve) => {
-      setTimeout(() => resolve(heuristicEval(candidate, job)), 300);
-    });
-  }
-
   const openRouterKey = process.env.OPENROUTER_API_KEY;
   if (!openRouterKey) {
-    console.warn('[AI] No OpenRouter key — using heuristic');
+    console.warn('[AI] No OpenRouter key — heuristic fallback');
     return Promise.resolve(heuristicEval(candidate, job));
   }
 
@@ -121,15 +116,14 @@ function runAiEvaluation(job: Job, candidate: Candidate): Promise<Partial<Screen
     headers: {
       'Authorization': `Bearer ${openRouterKey}`,
       'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://recruitai-yc07.onrender.com',
+      'HTTP-Referer': PUBLIC_URL,
       'X-Title': 'Recruit-AI'
     },
     body: JSON.stringify({
       model: 'mistralai/mistral-7b-instruct:free',
-      messages: [
-        {
-          role: 'user',
-          content: `You are an expert HR evaluation agent. Evaluate this candidate against the job and return ONLY valid JSON.
+      messages: [{
+        role: 'user',
+        content: `You are an expert HR evaluation agent. Evaluate this candidate against the job and return ONLY valid JSON.
 
 JOB:
 Title: ${job.title}
@@ -144,80 +138,57 @@ Experience: ${candidate.experienceYears} years
 Resume: ${(candidate.resumeText || '').slice(0, 3000)}
 
 Return ONLY this JSON:
-{
-  "score": 75,
-  "tier": "good_fit",
-  "reasoning": "explanation here",
-  "skillMatch": {"matched": [], "missing": [], "niceToHave": []},
-  "experienceAlignment": "X years vs Y required",
-  "educationAlignment": "degree info",
-  "redFlags": [],
-  "biasIndicators": {"ageRisk": false, "genderRisk": false, "locationRisk": false, "explanation": "none"},
-  "proposedQuestions": ["question 1", "question 2"],
-  "estimatedOnboarding": "2-4 weeks",
-  "strengths": ["strength 1"]
-}`
-        }
-      ]
+{"score":75,"tier":"good_fit","reasoning":"explanation","skillMatch":{"matched":[],"missing":[],"niceToHave":[]},"experienceAlignment":"X years vs Y","educationAlignment":"degree info","redFlags":[],"biasIndicators":{"ageRisk":false,"genderRisk":false,"locationRisk":false,"explanation":"none"},"proposedQuestions":["q1","q2"],"estimatedOnboarding":"2-4 weeks","strengths":["s1"]}`
+      }]
     })
   })
-  .then(async r => {
-    const data = await r.json();
-    const text = data?.choices?.[0]?.message?.content || '{}';
-    try {
-      const clean = text.replace(/```json|```/g, '').trim();
-      return JSON.parse(clean);
-    } catch {
+    .then(async r => {
+      const data = await r.json();
+      const text = data?.choices?.[0]?.message?.content || '{}';
+      try {
+        return JSON.parse(text.replace(/```json|```/g, '').trim());
+      } catch {
+        return heuristicEval(candidate, job);
+      }
+    })
+    .catch((err: any) => {
+      console.warn('[AI FALLBACK]', err?.message?.slice(0, 80));
       return heuristicEval(candidate, job);
-    }
-  })
-  .catch((err: any) => {
-    console.warn('[AI FALLBACK] OpenRouter failed:', err?.message?.slice(0, 80));
-    return heuristicEval(candidate, job);
-  });
+    });
 }
 
-async function getSmtpConfig() {
-  const { data } = await supabase.from('app_settings').select('value').eq('key', 'smtp').single();
-  return data?.value ?? { host: process.env.SMTP_HOST || 'smtp.gmail.com', port: parseInt(process.env.SMTP_PORT || '587'), user: process.env.SMTP_USER || '', pass: process.env.SMTP_PASS || '', from: process.env.SMTP_FROM || 'noreply@recruit-ai.com' };
-}
-
+// ── EMAIL (Brevo) ───────────────────────────────────────────────────────────
 async function dispatchEmailNotification(toEmail: string, subject: string, bodyText: string) {
   console.log(`[EMAIL] To: ${toEmail} | ${subject}`);
   const apiKey = process.env.BREVO_API_KEY;
-  const senderEmail = process.env.BREVO_SENDER_EMAIL || process.env.SMTP_USER || 'noreply@recruit-ai.com';
+  const senderEmail = process.env.BREVO_SENDER_EMAIL || 'noreply@recruit-ai.com';
   if (!apiKey) {
-    console.log(`[EMAIL SIM] No Brevo API key — skipping.`);
+    console.log('[EMAIL SIM] No Brevo API key — skipping.');
     return { success: true, simulated: true };
   }
   try {
     const res = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
-      headers: {
-        'api-key': apiKey,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sender: { name: 'Recruit-AI', email: senderEmail },
-        to: [{ email: toEmail }],
-        subject,
-        textContent: bodyText
+        to: [{ email: toEmail }], subject, textContent: bodyText
       })
     });
     const data = await res.json();
     if (res.ok) {
-      console.log(`[EMAIL OK] messageId: ${data.messageId}`);
+      console.log(`[EMAIL OK] ${data.messageId}`);
       return { success: true, messageId: data.messageId };
-    } else {
-      console.error(`[EMAIL ERROR]`, data);
-      return { success: false, error: data };
     }
+    console.error('[EMAIL ERROR]', data);
+    return { success: false, error: data };
   } catch (err) {
-    console.error(`[EMAIL ERROR]`, err);
+    console.error('[EMAIL ERROR]', err);
     return { success: false, error: err };
   }
 }
 
+// ── AUTO-SCHEDULE INTERVIEW ─────────────────────────────────────────────────
 async function autoScheduleCandidateInterview(candidateId: string, jobId: string) {
   const [{ data: candRow }, { data: jobRow }] = await Promise.all([
     supabase.from('candidates').select('*').eq('id', candidateId).single(),
@@ -234,7 +205,9 @@ async function autoScheduleCandidateInterview(candidateId: string, jobId: string
   let scheduledDate = '', scheduledTime = '', found = false;
 
   for (let d = 0; d < 14 && !found; d++) {
-    if (targetDate.getDay() === 0 || targetDate.getDay() === 6) { targetDate.setDate(targetDate.getDate() + 1); continue; }
+    if (targetDate.getDay() === 0 || targetDate.getDay() === 6) {
+      targetDate.setDate(targetDate.getDate() + 1); continue;
+    }
     const dateStr = targetDate.toISOString().split('T')[0];
     for (const slot of slots) {
       if (!(existingInterviews ?? []).some((i: any) => i.date === dateStr && i.time === slot)) {
@@ -243,84 +216,159 @@ async function autoScheduleCandidateInterview(candidateId: string, jobId: string
     }
     if (!found) targetDate.setDate(targetDate.getDate() + 1);
   }
-  if (!found) { const d = new Date(); d.setDate(d.getDate() + 2); scheduledDate = d.toISOString().split('T')[0]; scheduledTime = '11:00'; }
+  if (!found) {
+    const d = new Date(); d.setDate(d.getDate() + 2);
+    scheduledDate = d.toISOString().split('T')[0]; scheduledTime = '11:00';
+  }
 
   const hash = Math.random().toString(36).substring(2, 12);
-  const meetLink = `https://meet.google.com/meet-${hash.slice(0,3)}-${hash.slice(3,7)}-${hash.slice(7,10)}`;
-  const newInterview = { id: `int-${Date.now()}`, candidate_id: candidateId, job_id: jobId, date: scheduledDate, time: scheduledTime, type: 'video', interviewer: 'Staff AI Systems Recruiter', status: 'scheduled', meeting_link: meetLink };
-  await supabase.from('interviews').insert(newInterview);
+  const meetLink = `https://meet.google.com/meet-${hash.slice(0, 3)}-${hash.slice(3, 7)}-${hash.slice(7, 10)}`;
+  await supabase.from('interviews').insert({
+    id: `int-${Date.now()}`, candidate_id: candidateId, job_id: jobId,
+    date: scheduledDate, time: scheduledTime, type: 'video',
+    interviewer: 'Staff AI Systems Recruiter', status: 'scheduled', meeting_link: meetLink
+  });
 
   const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', candidateId).eq('job_id', jobId).single();
   if (pRow) {
-    const history = [...(pRow.stage_history ?? []), { stage: 'interview', changedAt: new Date().toISOString(), changedBy: 'AI Recruiter Bot', notes: 'Auto-scheduled interview.' }];
+    const history = [...(pRow.stage_history ?? []), { stage: 'interview', changedAt: new Date().toISOString(), changedBy: 'AI Recruiter Bot', notes: 'Auto-scheduled.' }];
     await supabase.from('pipeline').update({ current_stage: 'interview', stage_history: history }).eq('candidate_id', candidateId).eq('job_id', jobId);
   }
 
   const subject = `Technical Interview Scheduled: ${job.title}`;
-  const body = `Hi ${cand.name},\n\nYour screening score qualifies you for a technical interview for "${job.title}".\n\n📅 Date: ${scheduledDate}\n⏰ Time: ${scheduledTime}\n💻 Meet: ${meetLink}\n\nWarm regards,\nRecruit-AI`;
+  const body = `Hi ${cand.name},\n\nYour score qualifies you for a technical interview for "${job.title}".\n\n📅 ${scheduledDate}\n⏰ ${scheduledTime}\n💻 ${meetLink}\n\nRecruit-AI`;
   await dispatchEmailNotification(cand.email, subject, body);
-  await supabase.from('communications').insert({ id: `comm-sched-${Date.now()}`, candidate_id: candidateId, job_id: jobId, type: 'email', subject, body, status: 'sent', sent_at: new Date().toISOString() });
+  await supabase.from('communications').insert({
+    id: `comm-sched-${Date.now()}`, candidate_id: candidateId, job_id: jobId,
+    type: 'email', subject, body, status: 'sent', sent_at: new Date().toISOString()
+  });
 }
 
+// ── EVALUATE + PERSIST SCREENING (shared by manual + auto) ──────────────────
+async function evaluateAndPersistScreening(candidateId: string, jobId: string) {
+  const [{ data: jobRow }, { data: candRow }] = await Promise.all([
+    supabase.from('jobs').select('*').eq('id', jobId).single(),
+    supabase.from('candidates').select('*').eq('id', candidateId).single()
+  ]);
+  if (!jobRow || !candRow) throw new Error('Job or Candidate not found');
+  const job = mapJob(jobRow);
+  const candidate = mapCandidate(candRow);
+
+  const result = await runAiEvaluation(job, candidate);
+  const screenRow = {
+    id: `scr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    candidate_id: candidateId, job_id: jobId,
+    score: result.score ?? 70, tier: result.tier ?? 'consider',
+    reasoning: result.reasoning ?? '',
+    skill_match: result.skillMatch ?? { matched: [], missing: [], niceToHave: [] },
+    experience_alignment: result.experienceAlignment ?? '',
+    education_alignment: result.educationAlignment ?? '',
+    red_flags: result.redFlags ?? [], bias_indicators: result.biasIndicators ?? {},
+    proposed_questions: result.proposedQuestions ?? [],
+    estimated_onboarding: result.estimatedOnboarding ?? 'Moderate',
+    strengths: result.strengths ?? [], screened_at: new Date().toISOString()
+  };
+  await supabase.from('screenings').delete().eq('candidate_id', candidateId).eq('job_id', jobId);
+  const { data: scrData } = await supabase.from('screenings').insert(screenRow).select().single();
+
+  const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', candidateId).eq('job_id', jobId).single();
+  if (pRow) {
+    let stage: PipelineStage = 'screening';
+    let note = `AI Score: ${screenRow.score}. `;
+    if (screenRow.score >= 75) { stage = 'shortlisted'; note += 'Auto-Shortlisted.'; }
+    else if (screenRow.score < 40) { stage = 'rejected'; note += 'Below threshold.'; }
+    const history = [...(pRow.stage_history ?? []), { stage, changedAt: new Date().toISOString(), changedBy: 'AI Recruiter Bot', notes: note }];
+    await supabase.from('pipeline').update({ current_stage: stage, stage_history: history }).eq('candidate_id', candidateId).eq('job_id', jobId);
+
+    const subject = stage === 'shortlisted' ? `Shortlisted: ${job.title}` : `Application Update: ${job.title}`;
+    const body = stage === 'shortlisted'
+      ? `Hi ${candidate.name},\n\nYou scored ${screenRow.score}% and have been shortlisted for ${job.title}.`
+      : `Hi ${candidate.name},\n\nThank you for applying.`;
+    dispatchEmailNotification(candidate.email, subject, body);
+    await supabase.from('communications').insert({
+      id: `comm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      candidate_id: candidateId, job_id: jobId, type: 'email',
+      subject, body, status: 'sent', sent_at: new Date().toISOString()
+    });
+    if (stage === 'shortlisted') await autoScheduleCandidateInterview(candidateId, jobId);
+  }
+  return scrData;
+}
+
+async function getSmtpConfig() {
+  const { data } = await supabase.from('app_settings').select('value').eq('key', 'smtp').single();
+  return data?.value ?? {
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587'),
+    user: process.env.SMTP_USER || '', pass: process.env.SMTP_PASS || '',
+    from: process.env.SMTP_FROM || 'noreply@recruit-ai.com'
+  };
+}
+
+// ── SERVER ──────────────────────────────────────────────────────────────────
 function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
   app.use(express.json({ limit: '20mb' }));
   app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
-  // ── STATUS ────────────────────────────────────────────────────────────────
   app.get('/api/status', (req, res) => {
-    const hasKey = !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY';
-    res.json({ configured: hasKey, mode: hasKey ? 'Production Gemini (Live)' : 'Simulation (Heuristic Fallback)' });
+    const hasKey = !!process.env.OPENROUTER_API_KEY;
+    res.json({ configured: hasKey, mode: hasKey ? 'Production AI (OpenRouter)' : 'Simulation (Heuristic)' });
   });
 
-  // ── PARSE RESUME (Gemini reads PDF natively — no extra libraries needed) ──
+  // ── PARSE RESUME ──────────────────────────────────────────────────────────
   app.post('/api/parse-resume', async (req, res) => {
+    const { fileBase64, fileName } = req.body;
+    const cleanNameFallback = (fileName || 'Candidate')
+      .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
+      .replace(/\b\w/g, (c: string) => c.toUpperCase());
+
+    const emptyResponse = {
+      name: cleanNameFallback, email: '', phone: '', location: '',
+      skills: [], experienceYears: 0, companies: [],
+      education: { degree: '', field: '', school: '', graduationYear: 0 },
+      resumeText: `Resume: ${fileName}`
+    };
+
     try {
-      const { fileBase64, fileName } = req.body;
       if (!fileBase64) return res.status(400).json({ error: 'No file data provided' });
 
-      const openRouterKey = process.env.OPENROUTER_API_KEY;
-      const cleanNameFallback = (fileName || 'Candidate')
-        .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
-        .replace(/\b\w/g, (c: string) => c.toUpperCase());
-
-      // No OpenRouter key — return name from filename
-      if (!openRouterKey) {
-        return res.json({
-          name: cleanNameFallback, email: '', phone: '', location: '',
-          skills: [], experienceYears: 0, companies: [],
-          education: { degree: '', field: '', school: '', graduationYear: 0 },
-          resumeText: `Resume: ${fileName}`
-        });
+      let pdfText = '';
+      try {
+        const pdfBuffer = Buffer.from(fileBase64, 'base64');
+        const pdfData = await pdfParse(pdfBuffer);
+        pdfText = (pdfData.text || '').replace(/\s+/g, ' ').trim().slice(0, 4000);
+        console.log(`[PDF-PARSE] Extracted ${pdfText.length} chars from ${fileName}`);
+      } catch (pdfErr: any) {
+        console.warn('[PDF-PARSE FAIL]', pdfErr?.message?.slice(0, 80));
       }
 
-      // Convert PDF base64 → text via a simple extraction attempt
-      // Then send text to OpenRouter for structured parsing
-      const pdfText = Buffer.from(fileBase64, 'base64').toString('utf-8')
-        .replace(/[^\x20-\x7E\n\r\t]/g, ' ')
-        .replace(/\s+/g, ' ').trim().slice(0, 4000);
+      const openRouterKey = process.env.OPENROUTER_API_KEY;
+      if (!openRouterKey || !pdfText) {
+        return res.json({ ...emptyResponse, resumeText: pdfText || emptyResponse.resumeText });
+      }
 
       const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${openRouterKey}`,
           'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://recruitai-yc07.onrender.com',
+          'HTTP-Referer': PUBLIC_URL,
           'X-Title': 'Recruit-AI'
         },
         body: JSON.stringify({
           model: 'mistralai/mistral-7b-instruct:free',
           messages: [{
             role: 'user',
-            content: `Extract candidate information from this resume text. Return ONLY valid JSON, no markdown.
+            content: `Extract candidate information from this resume. Return ONLY valid JSON, no markdown.
 
-Resume text: ${pdfText}
+Resume: ${pdfText}
 
 Return this exact JSON:
 {"name":"","email":"","phone":"","location":"","skills":[],"experienceYears":0,"companies":[{"company":"","role":"","duration":""}],"education":{"degree":"","field":"","school":"","graduationYear":0},"resumeText":""}
 
-Rules: Extract ONLY what is in the text. skills = real technical skills only. resumeText = full text above.`
+Rules: Extract ONLY what is in the text. skills = real technical skills only. resumeText = first 2000 chars of resume.`
           }]
         })
       });
@@ -335,8 +383,7 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
       console.log(`[PARSE-RESUME OK] ${parsed.name || cleanNameFallback}`);
       res.json({
         name: parsed.name || cleanNameFallback,
-        email: parsed.email || '',
-        phone: parsed.phone || '',
+        email: parsed.email || '', phone: parsed.phone || '',
         location: parsed.location || '',
         skills: Array.isArray(parsed.skills) ? parsed.skills : [],
         experienceYears: Number(parsed.experienceYears) || 0,
@@ -345,20 +392,10 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
         resumeText: parsed.resumeText || pdfText
       });
     } catch (err: any) {
-      console.warn('[PARSE-RESUME FALLBACK]', err.message?.slice(0, 80));
-      // Always return something usable — never crash the upload
-      const cleanName = (fileName || 'Candidate')
-        .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
-        .replace(/\b\w/g, (c: string) => c.toUpperCase());
-      res.json({
-        name: cleanName, email: '', phone: '', location: '',
-        skills: [], experienceYears: 0, companies: [],
-        education: { degree: '', field: '', school: '', graduationYear: 0 },
-        resumeText: `Resume: ${fileName}`
-      });
+      console.warn('[PARSE-RESUME FAIL]', err?.message?.slice(0, 80));
+      res.json(emptyResponse);
     }
   });
-
 
   // ── JOBS ──────────────────────────────────────────────────────────────────
   app.get('/api/jobs', async (req, res) => {
@@ -369,7 +406,17 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
 
   app.post('/api/jobs', async (req, res) => {
     const b = req.body;
-    const row = { id: `job-${Date.now()}`, title: b.title || 'Untitled Job', department: b.department || 'General', location: b.location || 'Remote', description: b.description || '', required_skills: b.requiredSkills ?? [], nice_to_have_skills: b.niceToHaveSkills ?? [], experience_years: Number(b.experienceYears) || 0, salary_min: Number(b.salaryMin) || 0, salary_max: Number(b.salaryMax) || 0, currency: 'USD', status: 'active', created_at: new Date().toISOString(), strictness: Number(b.strictness) || 50, weights: b.weights ?? { skills: 40, experience: 35, education: 15, other: 10 } };
+    const row = {
+      id: `job-${Date.now()}`, title: b.title || 'Untitled Job',
+      department: b.department || 'General', location: b.location || 'Remote',
+      description: b.description || '', required_skills: b.requiredSkills ?? [],
+      nice_to_have_skills: b.niceToHaveSkills ?? [],
+      experience_years: Number(b.experienceYears) || 0,
+      salary_min: Number(b.salaryMin) || 0, salary_max: Number(b.salaryMax) || 0,
+      currency: 'USD', status: 'active', created_at: new Date().toISOString(),
+      strictness: Number(b.strictness) || 50,
+      weights: b.weights ?? { skills: 40, experience: 35, education: 15, other: 10 }
+    };
     const { data, error } = await supabase.from('jobs').insert(row).select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.status(201).json(mapJob(data));
@@ -416,12 +463,32 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
   app.post('/api/candidates', async (req, res) => {
     const b = req.body;
     const id = `cand-${Date.now()}`;
-    const row = { id, name: b.name || 'Anonymous', email: b.email || '', phone: b.phone || '', location: b.location || 'Remote', skills: b.skills ?? [], experience_years: Number(b.experienceYears) || 0, companies: b.companies ?? [], education: b.education ?? { degree: 'N/A', field: 'N/A', school: 'N/A', graduationYear: 2024 }, resume_text: b.resumeText || '', uploaded_at: new Date().toISOString(), resume_file_name: b.resumeFileName || 'Uploaded_Resume.pdf' };
+    const row = {
+      id, name: b.name || 'Anonymous', email: b.email || '',
+      phone: b.phone || '', location: b.location || 'Remote',
+      skills: b.skills ?? [], experience_years: Number(b.experienceYears) || 0,
+      companies: b.companies ?? [],
+      education: b.education ?? { degree: 'N/A', field: 'N/A', school: 'N/A', graduationYear: 2024 },
+      resume_text: b.resumeText || '', uploaded_at: new Date().toISOString(),
+      resume_file_name: b.resumeFileName || 'Uploaded_Resume.pdf'
+    };
     const { data, error } = await supabase.from('candidates').insert(row).select().single();
     if (error) return res.status(500).json({ error: error.message });
     const jobId = b.jobId || (await supabase.from('jobs').select('id').limit(1).single()).data?.id || '';
-    const pipeRow = { candidate_id: id, job_id: jobId, current_stage: 'applied', stage_history: [{ stage: 'applied', changedAt: new Date().toISOString(), changedBy: 'System', notes: 'Application registered.' }], decision: 'pending' };
+    const pipeRow = {
+      candidate_id: id, job_id: jobId, current_stage: 'applied',
+      stage_history: [{ stage: 'applied', changedAt: new Date().toISOString(), changedBy: 'System', notes: 'Application registered.' }],
+      decision: 'pending'
+    };
     const { data: pData } = await supabase.from('pipeline').insert(pipeRow).select().single();
+
+    // Auto-trigger AI screening (fire and forget)
+    if (jobId) {
+      evaluateAndPersistScreening(id, jobId).catch(err =>
+        console.error('[AUTO-SCREEN]', err?.message)
+      );
+    }
+
     res.status(201).json({ candidate: mapCandidate(data), pipeline: pData ? mapPipeline(pData) : null });
   });
 
@@ -429,19 +496,48 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
     const { list, jobId } = req.body;
     if (!Array.isArray(list)) return res.status(400).json({ error: 'list must be an array' });
     const jobFallback = jobId || (await supabase.from('jobs').select('id').limit(1).single()).data?.id || '';
-    const candRows = list.map((item: any, i: number) => ({ id: `cand-${Date.now()}-${i}`, name: item.name || `Batch #${i+1}`, email: item.email || `batch${i}@recruit-ai.org`, phone: item.phone || '', location: item.location || 'Remote', skills: item.skills ?? [], experience_years: Number(item.experienceYears) || 3, companies: item.companies ?? [], education: item.education ?? { degree: 'Bachelor', field: 'Engineering', school: 'Tech Institute', graduationYear: 2022 }, resume_text: item.resumeText || '', uploaded_at: new Date().toISOString(), resume_file_name: item.resumeFileName || `CV_Batch_${i+1}.pdf` }));
+    const candRows = list.map((item: any, i: number) => ({
+      id: `cand-${Date.now()}-${i}`, name: item.name || `Batch #${i + 1}`,
+      email: item.email || `batch${i}@recruit-ai.org`, phone: item.phone || '',
+      location: item.location || 'Remote', skills: item.skills ?? [],
+      experience_years: Number(item.experienceYears) || 3,
+      companies: item.companies ?? [],
+      education: item.education ?? { degree: 'Bachelor', field: 'Engineering', school: 'Tech Institute', graduationYear: 2022 },
+      resume_text: item.resumeText || '', uploaded_at: new Date().toISOString(),
+      resume_file_name: item.resumeFileName || `CV_Batch_${i + 1}.pdf`
+    }));
     const { data: inserted, error } = await supabase.from('candidates').insert(candRows).select();
     if (error) return res.status(500).json({ error: error.message });
-    const pipeRows = candRows.map(c => ({ candidate_id: c.id, job_id: jobFallback, current_stage: 'applied', stage_history: [{ stage: 'applied', changedAt: new Date().toISOString(), changedBy: 'Batch Importer', notes: 'Bulk processed.' }], decision: 'pending' }));
+    const pipeRows = candRows.map(c => ({
+      candidate_id: c.id, job_id: jobFallback, current_stage: 'applied',
+      stage_history: [{ stage: 'applied', changedAt: new Date().toISOString(), changedBy: 'Batch Importer', notes: 'Bulk processed.' }],
+      decision: 'pending'
+    }));
     const { data: pInserted } = await supabase.from('pipeline').insert(pipeRows).select();
-    res.status(201).json({ candidates: (inserted ?? []).map(mapCandidate), pipelines: (pInserted ?? []).map(mapPipeline) });
+
+    // Auto-trigger AI screening for each candidate (fire and forget)
+    if (jobFallback) {
+      for (const c of candRows) {
+        evaluateAndPersistScreening(c.id, jobFallback).catch(err =>
+          console.error('[AUTO-SCREEN BULK]', err?.message)
+        );
+      }
+    }
+
+    res.status(201).json({
+      candidates: (inserted ?? []).map(mapCandidate),
+      pipelines: (pInserted ?? []).map(mapPipeline)
+    });
   });
 
   app.post('/api/candidates/:id/blacklist', async (req, res) => {
     const { id } = req.params;
     const { reason, blacklist } = req.body;
     const isBlacklisted = blacklist !== false;
-    const { data, error } = await supabase.from('candidates').update({ blacklisted: isBlacklisted, blacklist_reason: isBlacklisted ? (reason || 'Flagged for recruitment violation') : '' }).eq('id', id).select().single();
+    const { data, error } = await supabase.from('candidates').update({
+      blacklisted: isBlacklisted,
+      blacklist_reason: isBlacklisted ? (reason || 'Flagged for recruitment violation') : ''
+    }).eq('id', id).select().single();
     if (error) return res.status(404).json({ error: 'Candidate not found' });
     if (isBlacklisted) {
       const { data: pipes } = await supabase.from('pipeline').select('*').eq('candidate_id', id);
@@ -453,7 +549,6 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
     res.json(mapCandidate(data));
   });
 
-  // ✅ EDIT candidate (name, email, phone)
   app.put('/api/candidates/:id', async (req, res) => {
     const { id } = req.params;
     const updates: any = {};
@@ -465,7 +560,6 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
     res.json(mapCandidate(data));
   });
 
-  // ✅ DELETE candidate + all related records
   app.delete('/api/candidates/:id', async (req, res) => {
     const { id } = req.params;
     await supabase.from('pipeline').delete().eq('candidate_id', id);
@@ -485,39 +579,10 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
   });
 
   app.post('/api/screenings/evaluate', async (req, res) => {
-    const { candidateId, jobId } = req.body;
-    const [{ data: jobRow }, { data: candRow }] = await Promise.all([
-      supabase.from('jobs').select('*').eq('id', jobId).single(),
-      supabase.from('candidates').select('*').eq('id', candidateId).single()
-    ]);
-    if (!jobRow || !candRow) return res.status(404).json({ error: 'Job or Candidate not found' });
-    const job = mapJob(jobRow);
-    const candidate = mapCandidate(candRow);
-
     try {
-      const result = await runAiEvaluation(job, candidate);
-      const screenRow = { id: `scr-${Date.now()}`, candidate_id: candidateId, job_id: jobId, score: result.score ?? 70, tier: result.tier ?? 'consider', reasoning: result.reasoning ?? '', skill_match: result.skillMatch ?? { matched: [], missing: [], niceToHave: [] }, experience_alignment: result.experienceAlignment ?? '', education_alignment: result.educationAlignment ?? '', red_flags: result.redFlags ?? [], bias_indicators: result.biasIndicators ?? {}, proposed_questions: result.proposedQuestions ?? [], estimated_onboarding: result.estimatedOnboarding ?? 'Moderate', strengths: result.strengths ?? [], screened_at: new Date().toISOString() };
-      await supabase.from('screenings').delete().eq('candidate_id', candidateId).eq('job_id', jobId);
-      const { data: scrData } = await supabase.from('screenings').insert(screenRow).select().single();
-
-      const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', candidateId).eq('job_id', jobId).single();
-      if (pRow) {
-        let stage: PipelineStage = 'screening';
-        let note = `AI Score: ${screenRow.score}. `;
-        if (screenRow.score >= 75) { stage = 'shortlisted'; note += 'Auto-Shortlisted (score ≥ 75).'; }
-        else if (screenRow.score < 40) { stage = 'rejected'; note += 'Below threshold — rejected.'; }
-        const history = [...(pRow.stage_history ?? []), { stage, changedAt: new Date().toISOString(), changedBy: 'AI Recruiter Bot', notes: note }];
-        await supabase.from('pipeline').update({ current_stage: stage, stage_history: history }).eq('candidate_id', candidateId).eq('job_id', jobId);
-
-        const subject = stage === 'shortlisted' ? `Shortlisted: ${job.title}` : `Application Update: ${job.title}`;
-        const body = stage === 'shortlisted'
-          ? `Hi ${candidate.name},\n\nYou scored ${screenRow.score}% and have been shortlisted for ${job.title}. We'll be in touch shortly.`
-          : `Hi ${candidate.name},\n\nThank you for applying. We've decided to move forward with other candidates at this time.`;
-        dispatchEmailNotification(candidate.email, subject, body);
-        await supabase.from('communications').insert({ id: `comm-${Date.now()}`, candidate_id: candidateId, job_id: jobId, type: 'email', subject, body, status: 'sent', sent_at: new Date().toISOString() });
-        if (stage === 'shortlisted') await autoScheduleCandidateInterview(candidateId, jobId);
-      }
-      res.status(200).json({ screening: scrData ? mapScreening(scrData) : screenRow });
+      const { candidateId, jobId } = req.body;
+      const result = await evaluateAndPersistScreening(candidateId, jobId);
+      res.status(200).json({ screening: result ? mapScreening(result) : null });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Evaluation failure' });
     }
@@ -545,9 +610,12 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
     ]);
     if (candRow && jobRow) {
       const subject = `Status Update: ${jobRow.title}`;
-      const body = `Hi ${candRow.name},\n\nYour application for ${jobRow.title} has moved to: ${stage.toUpperCase()}.\n\nNotes: "${notes || 'Under review.'}"\n\nWarm regards,\nRecruit-AI`;
+      const body = `Hi ${candRow.name},\n\nYour application for ${jobRow.title} has moved to: ${stage.toUpperCase()}.\n\nNotes: "${notes || 'Under review.'}"\n\nRecruit-AI`;
       dispatchEmailNotification(candRow.email, subject, body);
-      await supabase.from('communications').insert({ id: `comm-${Date.now()}`, candidate_id: candidateId, job_id: jobId, type: 'email', subject, body, status: 'sent', sent_at: new Date().toISOString() });
+      await supabase.from('communications').insert({
+        id: `comm-${Date.now()}`, candidate_id: candidateId, job_id: jobId,
+        type: 'email', subject, body, status: 'sent', sent_at: new Date().toISOString()
+      });
     }
     res.json(updated ? mapPipeline(updated) : {});
   }
@@ -572,7 +640,11 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
 
   app.post('/api/communications', async (req, res) => {
     const b = req.body;
-    const row = { id: `comm-${Date.now()}`, candidate_id: b.candidateId, job_id: b.jobId, type: b.type || 'email', subject: b.subject || 'No Subject', body: b.body || '', status: 'sent', sent_at: new Date().toISOString() };
+    const row = {
+      id: `comm-${Date.now()}`, candidate_id: b.candidateId, job_id: b.jobId,
+      type: b.type || 'email', subject: b.subject || 'No Subject', body: b.body || '',
+      status: 'sent', sent_at: new Date().toISOString()
+    };
     const { data, error } = await supabase.from('communications').insert(row).select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.status(201).json(mapCommunication(data));
@@ -587,7 +659,13 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
 
   app.post('/api/interviews', async (req, res) => {
     const b = req.body;
-    const row = { id: `int-${Date.now()}`, candidate_id: b.candidateId, job_id: b.jobId, date: b.date || new Date().toISOString().split('T')[0], time: b.time || '12:00', type: b.type || 'video', interviewer: b.interviewer || 'Recruiter', status: 'scheduled', meeting_link: b.meetingLink || 'https://meet.google.com/meet-link' };
+    const row = {
+      id: `int-${Date.now()}`, candidate_id: b.candidateId, job_id: b.jobId,
+      date: b.date || new Date().toISOString().split('T')[0],
+      time: b.time || '12:00', type: b.type || 'video',
+      interviewer: b.interviewer || 'Recruiter', status: 'scheduled',
+      meeting_link: b.meetingLink || 'https://meet.google.com/meet-link'
+    };
     const { data, error } = await supabase.from('interviews').insert(row).select().single();
     if (error) return res.status(500).json({ error: error.message });
     const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', b.candidateId).eq('job_id', b.jobId).single();
@@ -600,7 +678,9 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
 
   app.post('/api/interviews/:id/feedback', async (req, res) => {
     const { rating, feedback } = req.body;
-    const { data, error } = await supabase.from('interviews').update({ status: 'completed', rating: Number(rating) || 5, feedback }).eq('id', req.params.id).select().single();
+    const { data, error } = await supabase.from('interviews').update({
+      status: 'completed', rating: Number(rating) || 5, feedback
+    }).eq('id', req.params.id).select().single();
     if (error) return res.status(404).json({ error: 'Interview not found' });
     const int = mapInterview(data);
     const { data: pRow } = await supabase.from('pipeline').select('*').eq('candidate_id', int.candidateId).eq('job_id', int.jobId).single();
@@ -611,7 +691,7 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
     res.json(int);
   });
 
-  // ── GMAIL ─────────────────────────────────────────────────────────────────
+  // ── GMAIL / SMTP / ANALYTICS ──────────────────────────────────────────────
   app.get('/api/gmail/status', async (req, res) => {
     const { data } = await supabase.from('app_settings').select('value').eq('key', 'gmail').single();
     res.json(data?.value ?? { connected: false, email: '' });
@@ -632,12 +712,20 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
     const { candidateId, jobId, subject, body } = req.body;
     const { data: gmailRow } = await supabase.from('app_settings').select('value').eq('key', 'gmail').single();
     const connected = gmailRow?.value?.connected ?? false;
-    const row = { id: `comm-${Date.now()}`, candidate_id: candidateId, job_id: jobId, type: 'email', subject: subject || 'Recruitment Update', body: body || '', status: connected ? 'sent' : 'pending', sent_at: new Date().toISOString() };
+    const row = {
+      id: `comm-${Date.now()}`, candidate_id: candidateId, job_id: jobId,
+      type: 'email', subject: subject || 'Recruitment Update',
+      body: body || '', status: connected ? 'sent' : 'pending',
+      sent_at: new Date().toISOString()
+    };
     const { data } = await supabase.from('communications').insert(row).select().single();
-    res.status(201).json({ success: true, message: connected ? 'Email dispatched!' : 'Email queued.', comm: data ? mapCommunication(data) : null });
+    res.status(201).json({
+      success: true,
+      message: connected ? 'Email dispatched!' : 'Email queued.',
+      comm: data ? mapCommunication(data) : null
+    });
   });
 
-  // ── SMTP ──────────────────────────────────────────────────────────────────
   app.get('/api/smtp/config', async (req, res) => {
     const cfg = await getSmtpConfig();
     res.json({ host: cfg.host, port: cfg.port, user: cfg.user, hasPassword: !!cfg.pass, from: cfg.from });
@@ -646,12 +734,15 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
   app.post('/api/smtp/config', async (req, res) => {
     const { host, port, user, pass, from } = req.body;
     const current = await getSmtpConfig();
-    const updated = { host: host ?? current.host, port: Number(port) || current.port, user: user ?? current.user, pass: pass ?? current.pass, from: from ?? current.from };
+    const updated = {
+      host: host ?? current.host, port: Number(port) || current.port,
+      user: user ?? current.user, pass: pass ?? current.pass,
+      from: from ?? current.from
+    };
     await supabase.from('app_settings').upsert({ key: 'smtp', value: updated });
     res.json({ success: true, message: 'SMTP config updated.' });
   });
 
-  // ── ANALYTICS ─────────────────────────────────────────────────────────────
   app.get('/api/analytics', async (req, res) => {
     const jobId = req.query.jobId as string;
     let query = supabase.from('pipeline').select('*');
@@ -662,33 +753,56 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
     const count = (stages: string[]) => p.filter(x => stages.includes(x.current_stage)).length;
     res.json({
       jobId: jobId || 'all', totalApplications: total,
-      funnel: { applied: total, screening: count(['screening','shortlisted','interview','offer','hired','rejected']), shortlisted: count(['shortlisted','interview','offer','hired']), interview: count(['interview','offer','hired']), offer: count(['offer','hired']), hired: count(['hired']), rejected: count(['rejected']) },
-      rates: { shortlistRate: total ? Math.round((count(['shortlisted','interview','offer','hired']) / total) * 100) : 0, interviewRate: count(['shortlisted','interview','offer','hired']) ? Math.round((count(['interview','offer','hired']) / count(['shortlisted','interview','offer','hired'])) * 100) : 0, hireRate: total ? Math.round((count(['hired']) / total) * 100) : 0 },
-      sources: [{ name: 'LinkedIn', count: Math.ceil(total * 0.45) }, { name: 'Direct Upload', count: Math.ceil(total * 0.25) }, { name: 'Indeed', count: Math.ceil(total * 0.20) }, { name: 'Referral', count: Math.ceil(total * 0.10) }],
+      funnel: {
+        applied: total,
+        screening: count(['screening', 'shortlisted', 'interview', 'offer', 'hired', 'rejected']),
+        shortlisted: count(['shortlisted', 'interview', 'offer', 'hired']),
+        interview: count(['interview', 'offer', 'hired']),
+        offer: count(['offer', 'hired']),
+        hired: count(['hired']), rejected: count(['rejected'])
+      },
+      rates: {
+        shortlistRate: total ? Math.round((count(['shortlisted', 'interview', 'offer', 'hired']) / total) * 100) : 0,
+        interviewRate: count(['shortlisted', 'interview', 'offer', 'hired']) ? Math.round((count(['interview', 'offer', 'hired']) / count(['shortlisted', 'interview', 'offer', 'hired'])) * 100) : 0,
+        hireRate: total ? Math.round((count(['hired']) / total) * 100) : 0
+      },
+      sources: [
+        { name: 'LinkedIn', count: Math.ceil(total * 0.45) },
+        { name: 'Direct Upload', count: Math.ceil(total * 0.25) },
+        { name: 'Indeed', count: Math.ceil(total * 0.20) },
+        { name: 'Referral', count: Math.ceil(total * 0.10) }
+      ],
       averageTimeToHire: 14
     });
   });
 
   // ── STATIC / VITE ─────────────────────────────────────────────────────────
+  const startKeepAlive = () => {
+    setInterval(() => {
+      fetch(`${PUBLIC_URL}/api/status`)
+        .then(() => console.log('[Keep-alive] pinged'))
+        .catch(() => {});
+    }, 10 * 60 * 1000);
+  };
+
   if (process.env.NODE_ENV !== 'production') {
     createViteServer({ server: { middlewareMode: true }, appType: 'spa' }).then((vite) => {
       app.use(vite.middlewares);
       app.get('*', (req, res) => res.sendFile(path.resolve(process.cwd(), 'index.html')));
-      app.listen(PORT, '0.0.0.0', () => console.log(`Dev server: http://localhost:${PORT}`));
+      app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Dev server: http://localhost:${PORT}`);
+        startKeepAlive();
+      });
     });
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
-    app.listen(PORT, '0.0.0.0', () => console.log(`Production server: http://localhost:${PORT}`));
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Production server: http://localhost:${PORT}`);
+      startKeepAlive();
+    });
   }
 }
-
-// Keep-alive ping every 10 mins
-setInterval(() => {
-  fetch('https://recruitai-yc07.onrender.com/api/status')
-    .then(() => console.log('[Keep-alive] pinged'))
-    .catch(() => {});
-}, 10 * 60 * 1000);
 
 startServer();
