@@ -109,7 +109,7 @@ function runAiEvaluation(job: Job, candidate: Candidate): Promise<Partial<Screen
   const prompt = `You are an expert HR evaluation agent. Evaluate this candidate against the job.\n\nJOB:\nTitle: ${job.title}\nRequired Skills: ${job.requiredSkills.join(', ')}\nExperience Required: ${job.experienceYears} years\nStrictness: ${job.strictness}\n\nCANDIDATE:\nName: ${candidate.name}\nSkills: ${candidate.skills.join(', ')}\nExperience: ${candidate.experienceYears} years\nResume: ${candidate.resumeText}\n\nRespond ONLY with JSON matching this exact schema.`;
 
   return ai.models.generateContent({
-    model: 'gemini-2.0-flash', contents: prompt,
+    model: 'gemini-1.5-flash', contents: prompt,
     config: {
       responseMimeType: 'application/json',
       responseSchema: {
@@ -273,7 +273,7 @@ Rules:
 - If a field is missing use empty string or 0`;
 
       const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-1.5-flash',
         contents: [
           {
             role: 'user',
