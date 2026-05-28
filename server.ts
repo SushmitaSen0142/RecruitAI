@@ -120,7 +120,7 @@ function runAiEvaluation(job: Job, candidate: Candidate): Promise<Partial<Screen
       'X-Title': 'Recruit-AI'
     },
     body: JSON.stringify({
-      model: 'mistralai/mistral-7b-instruct:free',
+      model: 'meta-llama/llama-3.3-70b-instruct:free',
       messages: [{
         role: 'user',
         content: `You are an expert HR evaluation agent. Evaluate this candidate against the job and return ONLY valid JSON.
@@ -358,7 +358,7 @@ function startServer() {
           'X-Title': 'Recruit-AI'
         },
         body: JSON.stringify({
-          model: 'mistralai/mistral-7b-instruct:free',
+          model: 'meta-llama/llama-3.3-70b-instruct:free',
           messages: [{
             role: 'user',
             content: `Extract candidate information from this resume. Return ONLY valid JSON, no markdown.
