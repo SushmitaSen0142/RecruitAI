@@ -6,7 +6,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 import { Job, Candidate, Screening, PipelineItem, PipelineStage, Communication, Interview } from './src/types';
 import nodemailer from 'nodemailer';
-import pdfParse from 'pdf-parse';
+
 
 dotenv.config();
 
@@ -226,91 +226,73 @@ function startServer() {
     res.json({ configured: hasKey, mode: hasKey ? 'Production Gemini (Live)' : 'Simulation (Heuristic Fallback)' });
   });
 
-  // ── PARSE RESUME ──────────────────────────────────────────────────────────
+  // ── PARSE RESUME (Gemini reads PDF natively — no extra libraries needed) ──
   app.post('/api/parse-resume', async (req, res) => {
     try {
       const { fileBase64, fileName } = req.body;
       if (!fileBase64) return res.status(400).json({ error: 'No file data provided' });
 
-      // Step 1: Extract raw text from PDF
-      const buffer = Buffer.from(fileBase64, 'base64');
-      let rawText = '';
-      try {
-        const parsed = await pdfParse(buffer);
-        rawText = parsed.text || '';
-      } catch (e) {
-        rawText = '';
-      }
+      const apiKey = process.env.GEMINI_API_KEY;
 
-      if (!rawText || rawText.trim().length < 30) {
-        // Fallback: return minimal data from filename only
+      // No Gemini key — return name from filename only
+      if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
         const cleanName = (fileName || 'Candidate')
           .replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' ')
           .replace(/\b\w/g, (c: string) => c.toUpperCase());
         return res.json({
           name: cleanName, email: '', phone: '', location: '',
-          skills: [], experienceYears: 0,
-          companies: [], education: { degree: '', field: '', school: '', graduationYear: 0 },
-          resumeText: rawText || `Resume file: ${fileName}`
+          skills: [], experienceYears: 0, companies: [],
+          education: { degree: '', field: '', school: '', graduationYear: 0 },
+          resumeText: `Resume: ${fileName}`
         });
       }
 
-      // Step 2: Use Gemini to extract structured candidate data
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-        // No Gemini — do basic regex extraction from text
-        const emailMatch = rawText.match(/[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}/);
-        const phoneMatch = rawText.match(/[\+\(]?[\d\s\-\(\)]{9,15}/);
-        const lines = rawText.split('\n').map((l: string) => l.trim()).filter(Boolean);
-        return res.json({
-          name: lines[0] || 'Unknown Candidate',
-          email: emailMatch ? emailMatch[0] : '',
-          phone: phoneMatch ? phoneMatch[0].trim() : '',
-          location: '', skills: [], experienceYears: 0,
-          companies: [], education: { degree: '', field: '', school: '', graduationYear: 0 },
-          resumeText: rawText
-        });
-      }
-
+      // Send PDF base64 directly to Gemini — it reads PDFs natively
       const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
-      const prompt = `Extract structured candidate information from this resume text. Return ONLY valid JSON.
 
-RESUME TEXT:
-${rawText.slice(0, 8000)}
+      const prompt = `You are a resume parser. Read this PDF resume carefully and extract all candidate information.
+Return ONLY a valid JSON object. No markdown, no backticks, no explanation — just JSON.
 
-Extract and return this exact JSON structure:
 {
-  "name": "full name",
+  "name": "candidate full name",
   "email": "email address or empty string",
   "phone": "phone number or empty string",
-  "location": "city, country or empty string",
-  "skills": ["skill1", "skill2"],
+  "location": "city and country or empty string",
+  "skills": ["actual", "skills", "from", "resume"],
   "experienceYears": 0,
   "companies": [{"company": "name", "role": "title", "duration": "X years"}],
-  "education": {"degree": "degree type", "field": "field of study", "school": "institution", "graduationYear": 0},
-  "resumeText": "full extracted resume text"
+  "education": {"degree": "degree type", "field": "field of study", "school": "institution", "graduationYear": 2020},
+  "resumeText": "complete text content of the resume"
 }
 
 Rules:
-- Extract ONLY information actually present in the resume
-- skills must be specific technical skills, tools, languages from the resume
-- experienceYears = total years of work experience found
-- If a field is not found, use empty string or empty array
-- resumeText = the full raw text provided`;
+- Extract ONLY what is actually written in the resume — never invent anything
+- skills = real technical skills, tools, frameworks, languages listed in the resume
+- experienceYears = total years of professional work experience
+- If a field is missing use empty string or 0`;
 
       const result = await ai.models.generateContent({
         model: 'gemini-2.0-flash',
-        contents: prompt,
-        config: { responseMimeType: 'application/json' }
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { inlineData: { mimeType: 'application/pdf', data: fileBase64 } },
+              { text: prompt }
+            ]
+          }
+        ]
       });
 
       let parsed: any = {};
       try {
-        parsed = JSON.parse(result.text || '{}');
+        const text = (result.text || '').replace(/```json|```/g, '').trim();
+        parsed = JSON.parse(text);
       } catch {
         parsed = {};
       }
 
+      console.log(`[PARSE-RESUME OK] ${parsed.name || fileName}`);
       res.json({
         name: parsed.name || 'Unknown Candidate',
         email: parsed.email || '',
@@ -320,13 +302,14 @@ Rules:
         experienceYears: Number(parsed.experienceYears) || 0,
         companies: Array.isArray(parsed.companies) ? parsed.companies : [],
         education: parsed.education || { degree: '', field: '', school: '', graduationYear: 0 },
-        resumeText: rawText
+        resumeText: parsed.resumeText || ''
       });
     } catch (err: any) {
-      console.error('[PARSE-RESUME ERROR]', err);
+      console.error('[PARSE-RESUME ERROR]', err.message);
       res.status(500).json({ error: err.message || 'Failed to parse resume' });
     }
   });
+
 
   // ── JOBS ──────────────────────────────────────────────────────────────────
   app.get('/api/jobs', async (req, res) => {
