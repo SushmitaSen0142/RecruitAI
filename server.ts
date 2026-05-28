@@ -374,11 +374,19 @@ Rules: Extract ONLY what is in the text. skills = real technical skills only. re
       });
 
       const orData = await orRes.json();
-      const rawText = orData?.choices?.[0]?.message?.content || '{}';
-      let parsed: any = {};
-      try {
-        parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim());
-      } catch { parsed = {}; }
+const rawText = orData?.choices?.[0]?.message?.content || '{}';
+console.log('[AI RAW RESPONSE]', rawText.slice(0, 1500));
+console.log('[AI USAGE]', JSON.stringify(orData?.usage || {}));
+console.log('[AI ERROR?]', JSON.stringify(orData?.error || 'none'));
+let parsed: any = {};
+try {
+  parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim());
+  console.log('[AI PARSED]', JSON.stringify(parsed).slice(0, 500));
+} catch (e: any) {
+  console.log('[AI PARSE FAIL]', e.message);
+  parsed = {};
+}
+
 
       console.log(`[PARSE-RESUME OK] ${parsed.name || cleanNameFallback}`);
       res.json({
