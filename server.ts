@@ -120,7 +120,7 @@ function runAiEvaluation(job: Job, candidate: Candidate): Promise<Partial<Screen
       'X-Title': 'Recruit-AI'
     },
     body: JSON.stringify({
-      model: 'poolside/laguna-m.1:free',
+      model: 'openai/gpt-oss-120b:free',
       messages: [{
         role: 'user',
         content: `You are an expert HR evaluation agent. Evaluate this candidate against the job and return ONLY valid JSON.
@@ -358,7 +358,7 @@ function startServer() {
           'X-Title': 'Recruit-AI'
         },
         body: JSON.stringify({
-          model: 'poolside/laguna-m.1:free',
+          model: 'openai/gpt-oss-120b:free',
           messages: [{
             role: 'user',
             content: `Extract candidate information from this resume. Return ONLY valid JSON, no markdown.
