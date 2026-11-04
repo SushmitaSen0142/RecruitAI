@@ -1,0 +1,153 @@
+diff --git a/.env.example b/.env.example
+index 7a550fe..6809ae5 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,9 +1,22 @@
+-# GEMINI_API_KEY: Required for Gemini AI API calls.
+-# AI Studio automatically injects this at runtime from user secrets.
+-# Users configure this via the Secrets panel in the AI Studio UI.
+-GEMINI_API_KEY="MY_GEMINI_API_KEY"
+-
+-# APP_URL: The URL where this applet is hosted.
+-# AI Studio automatically injects this at runtime with the Cloud Run service URL.
+-# Used for self-referential links, OAuth callbacks, and API endpoints.
+-APP_URL="MY_APP_URL"
++# Copy this file to `.env` (the server loads .env, not .env.local) and fill in the values.
++
++# ── REQUIRED ────────────────────────────────────────────────────────────────
++# Supabase project (Dashboard → Project Settings → API).
++# Use the service_role key: it is only ever used on the server, never sent to the browser.
++SUPABASE_URL="https://YOUR-PROJECT.supabase.co"
++SUPABASE_SERVICE_KEY="YOUR_SUPABASE_SERVICE_ROLE_KEY"
++
++# ── OPTIONAL ────────────────────────────────────────────────────────────────
++# OpenRouter key for AI resume parsing and candidate scoring.
++# Without it the app falls back to a simple heuristic scorer.
++OPENROUTER_API_KEY=""
++
++# Brevo key for sending real emails. Without it, emails are only logged to the console.
++BREVO_API_KEY=""
++BREVO_SENDER_EMAIL="noreply@recruit-ai.com"
++
++# Public URL of your deployment (used for the OpenRouter referer and the keep-alive ping).
++PUBLIC_URL="http://localhost:3000"
++
++# Port to listen on (default 3000).
++PORT=3000
+diff --git a/README.md b/README.md
+index 70f27b1..d7c62b8 100644
+--- a/README.md
++++ b/README.md
+@@ -15,6 +15,7 @@ View your app in AI Studio: https://ai.studio/apps/e1c0de0a-82a9-4cb5-8911-bffb7
+ 
+ 1. Install dependencies:
+    `npm install`
+-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
++2. Copy `.env.example` to `.env` and set at least `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`
++   (the server won't start without them). `OPENROUTER_API_KEY` and `BREVO_API_KEY` are optional.
+ 3. Run the app:
+    `npm run dev`
+diff --git a/server.ts b/server.ts
+index 8aacf2d..e5d133f 100644
+--- a/server.ts
++++ b/server.ts
+@@ -8,6 +8,15 @@ import { Job, Candidate, Screening, PipelineItem, PipelineStage, Communication,
+ 
+ dotenv.config();
+ 
++const missingEnv = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY'].filter(k => !process.env[k]);
++if (missingEnv.length) {
++  console.error(
++    `\n[CONFIG ERROR] Missing required environment variable(s): ${missingEnv.join(', ')}\n` +
++    `Copy .env.example to .env and fill them in (Supabase dashboard → Project Settings → API).\n`
++  );
++  process.exit(1);
++}
++
+ const supabase = createClient(
+   process.env.SUPABASE_URL!,
+   process.env.SUPABASE_SERVICE_KEY!
+diff --git a/src/App.tsx b/src/App.tsx
+index 47236b9..b19a58c 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -43,12 +43,13 @@ export default function App() {
+         fetch('/api/status').then(r => r.json())
+       ]);
+ 
+-      setJobs(jobsRes);
+-      setCandidates(candRes);
+-      setScreenings(scrRes);
+-      setPipeline(pipeRes);
+-      setInterviews(meetRes);
+-      setStatusMode(statusRes.mode);
++      // Only accept arrays: a failed API call returns { error }, which would crash .map() and blank the page
++      if (Array.isArray(jobsRes)) setJobs(jobsRes);
++      if (Array.isArray(candRes)) setCandidates(candRes);
++      if (Array.isArray(scrRes)) setScreenings(scrRes);
++      if (Array.isArray(pipeRes)) setPipeline(pipeRes);
++      if (Array.isArray(meetRes)) setInterviews(meetRes);
++      if (statusRes?.mode) setStatusMode(statusRes.mode);
+ 
+       // Default candidate preset
+       if (candRes && candRes.length > 0 && !candidateSelectorEmail) {
+@@ -134,6 +135,20 @@ export default function App() {
+     }
+   };
+ 
++  const handleEditCandidate = async (id: string, updates: Partial<Candidate>) => {
++    try {
++      await fetch(`/api/candidates/${id}`, {
++        method: 'PUT',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify(updates)
++      }).then(r => r.json());
++
++      await syncStateData();
++    } catch (err) {
++      console.error('Candidate update failed:', err);
++    }
++  };
++
+   const handleTriggerScreening = async (candidateId: string, jobId: string) => {
+     try {
+       const response = await fetch('/api/screenings/evaluate', {
+@@ -276,8 +291,9 @@ export default function App() {
+             candidates={candidates} 
+             screenings={screenings} 
+             pipeline={pipeline} 
+-            onTriggerScreening={handleTriggerScreening} 
++            onTriggerScreening={handleTriggerScreening}
+             onUpdatePipelineStage={handleUpdatePipelineStage}
++            onEditCandidate={handleEditCandidate}
+           />
+         );
+       case 'pipeline':
+diff --git a/src/components/ScreeningView.tsx b/src/components/ScreeningView.tsx
+index c448855..9d3bb98 100644
+--- a/src/components/ScreeningView.tsx
++++ b/src/components/ScreeningView.tsx
+@@ -22,15 +22,17 @@ interface ScreeningViewProps {
+   pipeline: PipelineItem[];
+   onTriggerScreening: (candId: string, jobId: string) => Promise<void>;
+   onUpdatePipelineStage: (candId: string, jobId: string, stage: string, notes: string) => void;
++  onEditCandidate: (candId: string, updates: Partial<Candidate>) => Promise<void> | void;
+ }
+ 
+-export default function ScreeningView({ 
+-  jobs, 
+-  candidates, 
+-  screenings, 
+-  pipeline, 
++export default function ScreeningView({
++  jobs,
++  candidates,
++  screenings,
++  pipeline,
+   onTriggerScreening,
+-  onUpdatePipelineStage
++  onUpdatePipelineStage,
++  onEditCandidate
+ }: ScreeningViewProps) {
+   const [selectedJobId, setSelectedJobId] = useState(jobs[0]?.id || '');
+   const [selectedCandidate, setSelectedCandidate] = useState<Candidate | null>(null);
